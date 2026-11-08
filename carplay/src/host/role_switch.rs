@@ -64,7 +64,21 @@ use crate::debug::read_attr;
 // TODO(hw): verify this is the port physically wired to the car on the OrangePi
 // 5 Plus (the board has multiple dwc3 instances; fc000000.usb is the USB3 OTG /
 // Type-C DRD one per the mainline rk3588 DTS).
-pub const UDC_NAME: &str = "fc000000.usb";
+pub const DEFAULT_UDC_NAME: &str = "fc000000.usb";
+
+/// The OTG controller's platform device name. `RASCAR_UDC` overrides the
+/// Orange Pi 5 Plus default, e.g. `20980000.usb` on a Raspberry Pi Zero W
+/// (dwc2, see `pizero/`).
+pub fn controller_name() -> &'static str {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::var("RASCAR_UDC")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_UDC_NAME.to_string())
+    })
+}
 
 /// Value written to request USB **host** mode.
 const ROLE_HOST: &str = "host";
@@ -91,6 +105,8 @@ pub struct RoleSwitch {
     /// fusb302 i2c devices (e.g. `6-0022`) unbound before the switch, so they
     /// can be re-bound on revert.
     unbound_typec: Vec<String>,
+    /// `RASCAR_ROLE_SWITCH_CMD`, when it is what switched the port.
+    command: Option<String>,
 }
 
 impl RoleSwitch {
@@ -99,6 +115,12 @@ impl RoleSwitch {
     /// unbound. Best-effort and never fails: it runs on error paths, where the
     /// interesting error is the one already being propagated.
     pub fn revert_to_device(&self) {
+        if let Some(cmd) = &self.command {
+            match run_role_cmd(cmd, "device") {
+                Ok(()) => info!("role-switch[cmd]: '{cmd} device' OK"),
+                Err(e) => warn!("role-switch[cmd]: '{cmd} device' failed: {e:#}"),
+            }
+        }
         if self.accepted.is_empty() && self.unbound_typec.is_empty() {
             return;
         }
@@ -316,7 +338,8 @@ impl AttemptResult {
 ///
 /// Blocking (sysfs writes plus a 300 ms settle): call from a blocking context.
 pub fn switch_to_host() -> Result<RoleSwitch> {
-    info!("role-switch: requesting USB device→host transition for {UDC_NAME}");
+    let udc = controller_name();
+    info!("role-switch: requesting USB device→host transition for {udc}");
     info!("role-switch: BEFORE snapshot: {}", role_snapshot());
 
     let mut any_present = false;
@@ -350,7 +373,7 @@ pub fn switch_to_host() -> Result<RoleSwitch> {
     }
 
     // 2) dwc3 debugfs mode.
-    let dbg_mode = PathBuf::from(format!("/sys/kernel/debug/usb/{UDC_NAME}/mode"));
+    let dbg_mode = PathBuf::from(format!("/sys/kernel/debug/usb/{udc}/mode"));
     match attempt("debugfs", &dbg_mode) {
         AttemptResult::Wrote => {
             any_present = true;
@@ -370,7 +393,7 @@ pub fn switch_to_host() -> Result<RoleSwitch> {
     // 3) dwc3 platform `role` attribute: /sys/bus/platform/devices/fc000000.usb/dwc3.*/role
     let dwc3_attrs = dwc3_role_attrs();
     if dwc3_attrs.is_empty() {
-        info!("role-switch[dwc3.role]: no /sys/bus/platform/devices/{UDC_NAME}/[dwc3.*/]role attribute present");
+        info!("role-switch[dwc3.role]: no /sys/bus/platform/devices/{udc}/[dwc3.*/]role attribute present");
     }
     for role_attr in dwc3_attrs {
         match attempt("dwc3.role", &role_attr) {
@@ -408,6 +431,23 @@ pub fn switch_to_host() -> Result<RoleSwitch> {
         }
     }
 
+    // 5) RASCAR_ROLE_SWITCH_CMD: for controllers with none of the knobs above
+    //    (e.g. a dwc2 kernel without CONFIG_USB_ROLE_SWITCH, `pizero/`). Only
+    //    when nothing else took the write.
+    if switched.accepted.is_empty() {
+        if let Some(cmd) = std::env::var("RASCAR_ROLE_SWITCH_CMD").ok().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()) {
+            any_present = true;
+            match run_role_cmd(&cmd, ROLE_HOST) {
+                Ok(()) => {
+                    info!("role-switch[cmd]: '{cmd} host' OK");
+                    methods.push("cmd");
+                    switched.command = Some(cmd);
+                }
+                Err(e) => warn!("role-switch[cmd]: {e:#}"),
+            }
+        }
+    }
+
     info!("role-switch: AFTER snapshot: {}", role_snapshot());
 
     if !any_present {
@@ -419,12 +459,12 @@ pub fn switch_to_host() -> Result<RoleSwitch> {
         switched.revert_to_device();
         bail!(
             "role-switch: none of the expected sysfs knobs exist \
-             (/sys/class/usb_role/*, /sys/kernel/debug/usb/{UDC_NAME}/mode, \
+             (/sys/class/usb_role/*, /sys/kernel/debug/usb/{udc}/mode, \
              .../dwc3.*/role, .../usb2-phy@*/otg_mode). \
              // TODO(hw): discover the real re-role interface on the board."
         );
     }
-    if switched.accepted.is_empty() {
+    if switched.accepted.is_empty() && switched.command.is_none() {
         warn!(
             "ROLE-SWITCH RESULT: method=none typec_unbound={:?} readback={} (mechanisms present but every write failed)",
             switched.unbound_typec,
@@ -438,14 +478,16 @@ pub fn switch_to_host() -> Result<RoleSwitch> {
     // bound flips it back within ~200 ms: read the mode again after it settles.
     let readback = result_readback(&switched);
     std::thread::sleep(MODE_SETTLE);
-    let settled_mode = read_attr(format!("/sys/kernel/debug/usb/{UDC_NAME}/mode"));
+    let mode_path = format!("/sys/kernel/debug/usb/{udc}/mode");
+    let has_dwc3_mode = Path::new(&mode_path).exists();
+    let settled_mode = read_attr(&mode_path);
     info!(
         "ROLE-SWITCH RESULT: method={} typec_unbound={:?} readback={readback} mode_after_{}ms={settled_mode}",
         methods.join(","),
         switched.unbound_typec,
         MODE_SETTLE.as_millis()
     );
-    if settled_mode != ROLE_HOST {
+    if has_dwc3_mode && settled_mode != ROLE_HOST {
         warn!(
             "role-switch: dwc3 mode is '{settled_mode}' {} ms after the host write — the port did not stay in host mode",
             MODE_SETTLE.as_millis()
@@ -460,6 +502,15 @@ pub fn switch_to_host() -> Result<RoleSwitch> {
     // TODO(hw): after this returns, wait_for_car_device() is the real proof; if it
     // times out, dump the readback values above to see which knob (if any) stuck.
     Ok(switched)
+}
+
+/// Run `RASCAR_ROLE_SWITCH_CMD` with `host` / `device`.
+fn run_role_cmd(cmd: &str, role: &str) -> Result<()> {
+    let status = std::process::Command::new(cmd).arg(role).status()?;
+    if !status.success() {
+        bail!("'{cmd} {role}' exited with {status}");
+    }
+    Ok(())
 }
 
 /// Run one host-mode write with a snapshot before and after it and the exact
@@ -486,6 +537,7 @@ fn attempt(tag: &'static str, path: &Path) -> AttemptResult {
 /// Readback string for the RESULT line: each accepted knob plus the dwc3 debugfs
 /// `mode` (which reports the controller's actual current role).
 fn result_readback(switched: &RoleSwitch) -> String {
+    let udc = controller_name();
     let mut parts: Vec<String> = switched
         .accepted
         .iter()
@@ -493,7 +545,7 @@ fn result_readback(switched: &RoleSwitch) -> String {
         .collect();
     parts.push(format!(
         "debugfs.mode={}",
-        read_attr(format!("/sys/kernel/debug/usb/{UDC_NAME}/mode"))
+        read_attr(format!("/sys/kernel/debug/usb/{udc}/mode"))
     ));
     parts.join(",")
 }
@@ -506,6 +558,7 @@ pub fn log_role_snapshot(label: &str) {
 /// One-line, best-effort dump of every knob that decides or reveals the port
 /// role. Never fails: unreadable values are rendered as `<error>`.
 pub fn role_snapshot() -> String {
+    let udc = controller_name();
     let mut parts: Vec<String> = Vec::new();
 
     // usb_role class switches — every readable regular file in each switch dir.
@@ -549,7 +602,7 @@ pub fn role_snapshot() -> String {
     }
 
     // dwc3 debugfs: the controller's current mode and link state.
-    let dbg = format!("/sys/kernel/debug/usb/{UDC_NAME}");
+    let dbg = format!("/sys/kernel/debug/usb/{udc}");
     parts.push(format!("debugfs.mode={}", read_attr(format!("{dbg}/mode"))));
     parts.push(format!("debugfs.link_state={}", read_attr(format!("{dbg}/link_state"))));
 
@@ -683,7 +736,8 @@ fn usb_role_switches() -> Vec<PathBuf> {
 
 /// Glob-ish scan for `/sys/bus/platform/devices/fc000000.usb/dwc3.*/role`.
 fn dwc3_role_attrs() -> Vec<PathBuf> {
-    let base = PathBuf::from(format!("/sys/bus/platform/devices/{UDC_NAME}"));
+    let udc = controller_name();
+    let base = PathBuf::from(format!("/sys/bus/platform/devices/{udc}"));
     let mut out = Vec::new();
     // Direct role attr on the platform device itself.
     let direct = base.join("role");

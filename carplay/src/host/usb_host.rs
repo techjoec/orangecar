@@ -191,12 +191,13 @@ async fn scan_once(seen: &mut HashSet<String>) -> Result<Option<CarDevice>> {
     Ok(None)
 }
 
-/// True when `sysfs` is a device below the role-switched dwc3 controller
-/// (`/sys/devices/platform/fc000000.usb/xhci-hcd.N.auto/usbX/...`).
+/// True when `sysfs` is a device below the role-switched controller
+/// (`/sys/devices/platform/fc000000.usb/xhci-hcd.N.auto/usbX/...` on the
+/// Orange Pi, `/sys/devices/platform/soc/20980000.usb/usb1/...` on a Pi Zero).
 fn on_role_switched_controller(sysfs: &Path) -> bool {
     sysfs
         .components()
-        .any(|c| c.as_os_str() == super::role_switch::UDC_NAME)
+        .any(|c| c.as_os_str() == super::role_switch::controller_name())
 }
 
 /// Multi-line inventory of one enumerated device: identity, class, and each
@@ -611,6 +612,9 @@ mod tests {
     #[test]
     fn only_the_role_switched_port_can_be_the_car() {
         // Where the car enumerated in every archived run.
+        if std::env::var("RASCAR_UDC").is_ok() {
+            return; // the test pins the default controller
+        }
         let car = Path::new("/sys/devices/platform/fc000000.usb/xhci-hcd.8.auto/usb7/7-1");
         // The 4G stick that was claimed as the car on 2026-09-29.
         let stick = Path::new("/sys/devices/platform/fc880000.usb/usb3/3-1");
