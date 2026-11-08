@@ -182,10 +182,21 @@ pub enum Mode {
     /// replayed from memory in a loop: no ffmpeg and almost no CPU during a
     /// session. The default for the test card, colour and image sources.
     Static,
+    /// No video at all (`none`): no encoder, no clip, no screen stream. The
+    /// session leaves MainScreen to the car's own UI.
+    None,
+}
+
+/// `RASCAR_VIDEO_MODE=none` (or `off`): video is a no-op.
+pub fn noop() -> bool {
+    matches!(std::env::var("RASCAR_VIDEO_MODE").ok().as_deref().map(str::trim), Some("none") | Some("off"))
 }
 
 impl Mode {
     fn for_source(source: &Source) -> Self {
+        if noop() {
+            return Mode::None;
+        }
         match std::env::var("RASCAR_VIDEO_MODE").ok().as_deref().map(str::trim) {
             Some("live") => Mode::Live,
             Some("static") if !source.is_live() => Mode::Static,

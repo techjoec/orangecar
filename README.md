@@ -93,6 +93,16 @@ The milestones, in order: `FFS event ENABLE`, `CARPLAY ROLE-SWITCH REQUEST`, `RO
 
 ## What's on the screen
 
+**Nothing, if you like: `RASCAR_VIDEO_MODE=none`.** Video becomes a no-op like audio: no ffmpeg, no
+clip, no screen stream. The Pi still does the whole CarPlay handshake and keeps the session alive, but
+tells the car its screen stays with the car's own UI. Pressing the CarPlay icon on the car is answered
+with "the screen stays yours". This is the lightest mode. Unverified in a real car: the original notes
+record that it was never tested whether the Jaguar keeps a session with no screen stream. If your car
+drops the session about 7-8 s in with this mode, use the default static mode, which costs almost as
+little.
+
+Otherwise, pick the picture:
+
 Set `RASCAR_VIDEO_SOURCE` in `/etc/rascar/carplay.env`:
 
 | Value | Picture |
@@ -146,7 +156,7 @@ Pressing the CarPlay icon on the car (or `screen phone`) takes it back.
   is ready. Unplug and replug, or power the Pi separately.
 - **USB endpoints.** The Pi's dwc2 has 7 device endpoints. The largest iPhone configuration needs 7.
   It should fit; if the car never selects a configuration, report it.
-- Wired CarPlay only. No audio, no Siri, no Now Playing.
+- Wired CarPlay only. No audio, no Siri, no Now Playing. Video can be off entirely (`RASCAR_VIDEO_MODE=none`).
 
 ## Bench test (no car, no Pi)
 

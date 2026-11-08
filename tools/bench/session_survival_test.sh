@@ -24,12 +24,14 @@ MIN_FRAMES=${MIN_FRAMES:-100}
 [[ -x $BIN ]] || { echo "no binary at $BIN"; exit 2; }
 
 fail=0
+# NOFRAMES=1: no video expected (RASCAR_VIDEO_MODE=none).
 # HANDBACK=1: "screen car" to 127.0.0.1:7704 at 6 s; the sim answers with
 # requestUI 3 s after the hand-back and checks the whole transition.
 run_case() {
     local label=$1; shift
     local handback=0 sim_extra=()
     if [[ ${1:-} == HANDBACK=1 ]]; then handback=1; sim_extra+=(--expect-handback); shift; fi
+    if [[ ${1:-} == NOFRAMES=1 ]]; then sim_extra+=(--min-frames 0); shift; fi
     echo "── $label"
     timeout $((RUN_SECS + 20)) python3 "$SIM" --port "$PORT" \
         --run-secs "$RUN_SECS" --min-survival-secs "$MIN_LIFE" \
@@ -59,6 +61,8 @@ echo
 run_case screen_only RASCAR_VIDEO_ENCODER=${RASCAR_VIDEO_ENCODER:-x264}
 # Screen handed to the car's native UI at ~6 s, taken back on the car's requestUI.
 run_case handback HANDBACK=1 RASCAR_VIDEO_ENCODER=${RASCAR_VIDEO_ENCODER:-x264}
+# No video at all: the session must survive with MainScreen left to the car.
+run_case video_none NOFRAMES=1 RASCAR_VIDEO_MODE=none
 
 if [[ $fail -eq 0 ]]; then
     echo "RESULT: session survives in every configuration."

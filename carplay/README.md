@@ -127,7 +127,7 @@ default.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `RASCAR_VIDEO_SOURCE` | `test` | Picture: `test`, `color:RRGGBB`, `image:PATH`, `fb[:/dev/fbN]`, `ffmpeg:ARGS`. |
-| `RASCAR_VIDEO_MODE` | `static` (`live` for `fb`/`ffmpeg:`) | `static`: encode a one-GOP clip once, cache it, replay it (no encoder during a session). `live`: run ffmpeg for the whole session. |
+| `RASCAR_VIDEO_MODE` | `static` (`live` for `fb`/`ffmpeg:`) | `static`: encode a one-GOP clip once, cache it, replay it (no encoder during a session). `live`: run ffmpeg for the whole session. `none`: no video at all; MainScreen is left to the car's UI and no screen stream is opened. |
 | `RASCAR_VIDEO_CACHE` | `/var/lib/rascar/video-cache` | Where static clips (and the last display size, for the pre-encode at start) are kept. |
 | `RASCAR_VIDEO_ENCODER` | probed | `v4l2m2m` (Pi hardware), `x264` or `openh264`. |
 | `RASCAR_VIDEO_FPS` | `15` | Screen stream frame rate. |
