@@ -41,7 +41,9 @@
 //! codec option) instead of H.264; we always offer H.264. An HEVC (`libx265`)
 //! variant exists behind `VideoSettings::hevc` but is unused.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
@@ -115,9 +117,124 @@ impl Default for VideoSettings {
     }
 }
 
+/// Where the picture comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// The OrangeCar dashboard: x11grab of `VideoSettings::display`, or the
+    /// Wayland kiosk (`stream::wlcapture`). The default.
+    Dashboard,
+    Test,
+    Color(String),
+    Image(String),
+    Framebuffer(String),
+    Raw(Vec<String>),
+}
+
+impl Source {
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var("RASCAR_VIDEO_SOURCE").ok().as_deref())
+    }
+
+    fn parse(raw: Option<&str>) -> Self {
+        let raw = raw.map(str::trim).unwrap_or("");
+        if raw.is_empty() || raw == "dashboard" {
+            return Source::Dashboard;
+        }
+        if raw == "test" {
+            return Source::Test;
+        }
+        if raw == "fb" {
+            return Source::Framebuffer("/dev/fb0".into());
+        }
+        match raw.split_once(':') {
+            Some(("color", c)) => Source::Color(c.trim_start_matches('#').to_string()),
+            Some(("image", p)) => Source::Image(p.to_string()),
+            Some(("fb", p)) => Source::Framebuffer(p.to_string()),
+            Some(("ffmpeg", a)) => Source::Raw(a.split_whitespace().map(String::from).collect()),
+            _ => {
+                warn!("video: RASCAR_VIDEO_SOURCE={raw:?} not understood — using the dashboard");
+                Source::Dashboard
+            }
+        }
+    }
+
+    /// ffmpeg input arguments, plus whether the input still needs scaling.
+    /// `realtime`: pace synthetic sources to the wall clock (live streaming);
+    /// off when pre-encoding a clip, which should finish as fast as possible.
+    fn input_args(&self, w: u32, h: u32, fps: u32, realtime: bool) -> (Vec<String>, bool) {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (mut args, scale) = match self {
+            // `-re`: synthetic sources are paced to real time, otherwise ffmpeg
+            // generates frames as fast as the CPU allows.
+            Source::Test => (v(&["-f", "lavfi", "-i", &format!("testsrc2=size={w}x{h}:rate={fps}")]), false),
+            Source::Color(c) => (v(&["-f", "lavfi", "-i", &format!("color=c=0x{c}:size={w}x{h}:rate={fps}")]), false),
+            Source::Image(p) => (v(&["-loop", "1", "-framerate", &fps.to_string(), "-i", p]), true),
+            // Captured by `VideoEncoder` itself (x11grab / Wayland).
+            Source::Dashboard => return (Vec::new(), false),
+            Source::Framebuffer(p) => return (v(&["-f", "fbdev", "-framerate", &fps.to_string(), "-i", p]), true),
+            Source::Raw(args) => return (args.clone(), true),
+        };
+        if realtime {
+            args.insert(0, "-re".into());
+        }
+        (args, scale)
+    }
+
+    /// Live sources change over time and must be encoded continuously; the
+    /// others can be encoded once and replayed (`Mode::Static`).
+    fn is_live(&self) -> bool {
+        matches!(self, Source::Dashboard | Source::Framebuffer(_) | Source::Raw(_))
+    }
+}
+
+/// How the stream is produced (`RASCAR_VIDEO_MODE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// ffmpeg runs for the whole session (needed for `fb` / `ffmpeg:` sources).
+    Live,
+    /// A one-GOP clip (1 IDR + P-frames) is encoded ONCE, cached on disk, and
+    /// replayed from memory in a loop: no ffmpeg and almost no CPU during a
+    /// session. The default for the test card, colour and image sources.
+    Static,
+    /// No video at all (`none`): no encoder, no clip, no screen stream. The
+    /// session leaves MainScreen to the car's own UI.
+    None,
+}
+
+/// True when the picture is the OrangeCar dashboard (the default), i.e. the
+/// session must render it and inject touches into it.
+pub fn uses_dashboard() -> bool {
+    Source::from_env() == Source::Dashboard
+}
+
+/// `RASCAR_VIDEO_MODE=none` (or `off`): video is a no-op.
+pub fn noop() -> bool {
+    matches!(std::env::var("RASCAR_VIDEO_MODE").ok().as_deref().map(str::trim), Some("none") | Some("off"))
+}
+
+impl Mode {
+    fn for_source(source: &Source) -> Self {
+        if noop() {
+            return Mode::None;
+        }
+        match std::env::var("RASCAR_VIDEO_MODE").ok().as_deref().map(str::trim) {
+            Some("live") => Mode::Live,
+            Some("static") if !source.is_live() => Mode::Static,
+            Some("static") => {
+                warn!("video: RASCAR_VIDEO_MODE=static ignored for the live source {source:?}");
+                Mode::Live
+            }
+            _ if source.is_live() => Mode::Live,
+            _ => Mode::Static,
+        }
+    }
+}
+
 pub struct VideoEncoder {
     settings: VideoSettings,
+    source: Source,
     process: Option<Child>,
+    replay: Option<Replay>,
 }
 
 
@@ -126,6 +243,9 @@ pub struct VideoEncoder {
 pub enum H264Encoder {
     X264,
     OpenH264,
+    /// V4L2 mem2mem hardware encoder (`h264_v4l2m2m`, e.g. the Raspberry Pi's
+    /// VideoCore). Only when asked for: `RASCAR_VIDEO_ENCODER=v4l2m2m`.
+    V4l2m2m,
 }
 
 /// Probe `ffmpeg -encoders` once and cache the answer.
@@ -137,6 +257,13 @@ pub fn h264_encoder() -> H264Encoder {
     use std::sync::OnceLock;
     static CHOICE: OnceLock<H264Encoder> = OnceLock::new();
     *CHOICE.get_or_init(|| {
+        match std::env::var("RASCAR_VIDEO_ENCODER").ok().as_deref().map(str::trim) {
+            Some("v4l2m2m") => return H264Encoder::V4l2m2m,
+            Some("x264") => return H264Encoder::X264,
+            Some("openh264") => return H264Encoder::OpenH264,
+            Some(other) if !other.is_empty() => warn!("video: RASCAR_VIDEO_ENCODER={other:?} unknown — probing"),
+            _ => {}
+        }
         let out = std::process::Command::new("ffmpeg")
             .args(["-hide_banner", "-encoders"])
             .output();
@@ -163,16 +290,22 @@ pub fn h264_encoder() -> H264Encoder {
 
 impl VideoEncoder {
     pub fn new(settings: VideoSettings) -> Self {
-        Self { settings, process: None }
+        Self { settings, source: Source::from_env(), process: None, replay: None }
     }
 
     fn build_args(&self) -> Vec<String> {
         self.build_args_for(None)
     }
 
-    /// `raw`: raw frames on stdin `(width, height, pix_fmt)` from
-    /// `stream::wlcapture`, instead of x11grab. Only the input differs.
     fn build_args_for(&self, raw: Option<(u32, u32, &str)>) -> Vec<String> {
+        self.build_args_out(raw, None)
+    }
+
+    /// `raw`: raw frames on stdin `(width, height, pix_fmt)` from
+    /// `stream::wlcapture`, instead of x11grab. `out`: `None` streams to stdout
+    /// (live); `Some((path, frames))` writes a clip of `frames` frames to `path`
+    /// as fast as possible (static mode).
+    fn build_args_out(&self, raw: Option<(u32, u32, &str)>, out: Option<(&str, u32)>) -> Vec<String> {
         let s = &self.settings;
         let mut args: Vec<String> = vec!["-loglevel".into(), "warning".into()];
         match raw {
@@ -183,6 +316,13 @@ impl VideoEncoder {
                 "-framerate".into(), s.fps.to_string(),
                 "-i".into(), "pipe:0".into(),
             ]),
+            None if self.source != Source::Dashboard => {
+                let (input, needs_scale) = self.source.input_args(s.width, s.height, s.fps, out.is_none());
+                args.extend(input);
+                if needs_scale {
+                    args.extend(["-vf".into(), format!("fps={},scale={}:{}", s.fps, s.width, s.height)]);
+                }
+            }
             None => args.extend([
                 "-f".into(), "x11grab".into(),
                 "-framerate".into(), s.fps.to_string(),
@@ -207,6 +347,22 @@ impl VideoEncoder {
                 "-b:v".into(), format!("{}k", s.bitrate_kbps),
                 "-x265-params".into(), format!("keyint={}:min-keyint={}:repeat-headers=1", s.keyframe_interval, s.keyframe_interval),
                 "-f".into(), "hevc".into(),
+                "-an".into(),
+                "pipe:1".into(),
+            ]);
+        } else if h264_encoder() == H264Encoder::V4l2m2m {
+            args.extend([
+                "-c:v".into(), "h264_v4l2m2m".into(),
+                "-pix_fmt".into(), "yuv420p".into(),
+                // 66 = FF_PROFILE_H264_BASELINE (v4l2m2m takes the numeric form).
+                "-profile:v".into(), "66".into(),
+                "-b:v".into(), format!("{}k", s.bitrate_kbps),
+                "-g".into(), s.keyframe_interval.to_string(),
+                "-bf".into(), "0".into(),
+                // Re-emit SPS/PPS before every keyframe if the encoder only put
+                // them in extradata: the packetizer needs them in-band.
+                "-bsf:v".into(), "dump_extra=freq=keyframe".into(),
+                "-f".into(), "h264".into(),
                 "-an".into(),
                 "pipe:1".into(),
             ]);
@@ -266,12 +422,34 @@ impl VideoEncoder {
                 "pipe:1".into(),
             ]);
         }
+        if let Some((path, frames)) = out {
+            if args.last().map(String::as_str) == Some("pipe:1") {
+                args.pop();
+            }
+            args.extend(["-frames:v".into(), frames.to_string(), "-y".into(), path.into()]);
+        }
         args
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        if let Some(target) = self.settings.wayland.clone() {
-            return self.start_wayland(target).await;
+        if Mode::for_source(&self.source) == Mode::Static {
+            remember_display(self.settings.width, self.settings.height);
+            match static_clip(self).await {
+                Ok(aus) => {
+                    info!(
+                        "video: replaying a cached {}-frame clip {}x{}@{} (source={:?}) — no encoder running",
+                        aus.len(), self.settings.width, self.settings.height, self.settings.fps, self.source
+                    );
+                    self.replay = Some(Replay::new(aus, self.settings.fps));
+                    return Ok(());
+                }
+                Err(e) => warn!("video: static clip unavailable ({e:#}) — encoding live instead"),
+            }
+        }
+        if self.source == Source::Dashboard {
+            if let Some(target) = self.settings.wayland.clone() {
+                return self.start_wayland(target).await;
+            }
         }
         let args = self.build_args();
         let codec = if self.settings.hevc {
@@ -280,9 +458,13 @@ impl VideoEncoder {
             match h264_encoder() {
                 H264Encoder::X264 => "H.264 baseline/libx264",
                 H264Encoder::OpenH264 => "H.264 constrained-baseline/libopenh264",
+                H264Encoder::V4l2m2m => "H.264 baseline/h264_v4l2m2m",
             }
         };
-        info!("video: starting ffmpeg x11grab of {} ({codec})", self.settings.display);
+        match &self.source {
+            Source::Dashboard => info!("video: starting ffmpeg x11grab of {} ({codec})", self.settings.display),
+            other => info!("video: starting ffmpeg on {other:?} ({codec})"),
+        }
         // Take the display from the settings, never from the process environ:
         // this runs on the multi-threaded runtime and nothing sets DISPLAY.
         let child = Command::new("ffmpeg")
@@ -340,6 +522,9 @@ impl VideoEncoder {
 
     /// Read a chunk of the elementary stream. `Ok(0)` = EOF (ffmpeg exited).
     pub async fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if let Some(r) = self.replay.as_mut() {
+            return Ok(r.read(buf).await);
+        }
         let child = self.process.as_mut().context("encoder not started")?;
         let stdout = child.stdout.as_mut().context("no stdout")?;
         Ok(stdout.read(buf).await?)
@@ -350,6 +535,10 @@ impl VideoEncoder {
     /// x11grab that cannot open the display exits immediately with a non-zero
     /// status, which would otherwise be indistinguishable from a clean end.
     pub async fn wait_exit(&mut self) -> Result<std::process::ExitStatus> {
+        if self.replay.take().is_some() {
+            use std::os::unix::process::ExitStatusExt;
+            return Ok(std::process::ExitStatus::from_raw(0));
+        }
         let mut child = self.process.take().context("encoder not started")?;
         child.wait().await.context("waiting for ffmpeg")
     }
@@ -357,6 +546,7 @@ impl VideoEncoder {
     /// Kill the encoder. The resulting status is a signal death by construction
     /// and therefore deliberately not reported.
     pub async fn stop(&mut self) {
+        self.replay = None;
         if let Some(mut child) = self.process.take() {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -371,6 +561,225 @@ impl Drop for VideoEncoder {
             let _ = child.start_kill();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Static mode: encode once, cache, replay
+// ---------------------------------------------------------------------------
+
+/// Loops over pre-encoded access units (Annex-B) at a fixed frame rate.
+struct Replay {
+    aus: Arc<Vec<Vec<u8>>>,
+    idx: usize,
+    offset: usize,
+    next_due: tokio::time::Instant,
+    period: Duration,
+}
+
+impl Replay {
+    fn new(aus: Arc<Vec<Vec<u8>>>, fps: u32) -> Self {
+        Self {
+            aus,
+            idx: 0,
+            offset: 0,
+            next_due: tokio::time::Instant::now(),
+            period: Duration::from_secs(1) / fps.max(1),
+        }
+    }
+
+    /// Cancellation-safe: the only await is the pacing sleep, and no state
+    /// changes before it completes.
+    async fn read(&mut self, buf: &mut [u8]) -> usize {
+        if self.offset == 0 {
+            tokio::time::sleep_until(self.next_due).await;
+        }
+        let au = &self.aus[self.idx];
+        let n = buf.len().min(au.len() - self.offset);
+        buf[..n].copy_from_slice(&au[self.offset..self.offset + n]);
+        self.offset += n;
+        if self.offset == au.len() {
+            self.offset = 0;
+            self.idx = (self.idx + 1) % self.aus.len();
+            self.next_due += self.period;
+            // Never try to catch up after a stall: just resume the cadence.
+            let now = tokio::time::Instant::now();
+            if self.next_due + self.period < now {
+                self.next_due = now;
+            }
+        }
+        n
+    }
+}
+
+fn cache_dir() -> PathBuf {
+    std::env::var("RASCAR_VIDEO_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/lib/rascar/video-cache"))
+}
+
+/// Remember the car's display size so the next start can pre-encode for it.
+fn remember_display(w: u32, h: u32) {
+    let dir = cache_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("last_display"), format!("{w}x{h}\n"));
+}
+
+fn last_display() -> (u32, u32) {
+    std::fs::read_to_string(cache_dir().join("last_display"))
+        .ok()
+        .and_then(|s| {
+            let (w, h) = s.trim().split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((800, 480))
+}
+
+/// Everything that changes the encoded clip.
+fn clip_key(enc: &VideoEncoder, encoder: H264Encoder) -> String {
+    use sha2::{Digest, Sha256};
+    let s = &enc.settings;
+    let mtime = match &enc.source {
+        Source::Image(p) => std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs()),
+        _ => 0,
+    };
+    let desc = format!(
+        "v1|{}x{}|{}|{}|{}|{encoder:?}|{:?}|{mtime}",
+        s.width, s.height, s.fps, s.bitrate_kbps, s.keyframe_interval, enc.source
+    );
+    hex::encode(&Sha256::digest(desc.as_bytes())[..8])
+}
+
+/// The clip for `enc`'s settings: from memory, else the disk cache, else
+/// encoded now with ffmpeg (once) and cached.
+async fn static_clip(enc: &VideoEncoder) -> Result<Arc<Vec<Vec<u8>>>> {
+    // One encode at a time: the pre-warm and a session may ask together.
+    static GEN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static MEM: std::sync::Mutex<Option<(String, Arc<Vec<Vec<u8>>>)>> = std::sync::Mutex::new(None);
+
+    let encoder = h264_encoder();
+    let key = clip_key(enc, encoder);
+    let _guard = GEN.lock().await;
+    if let Some((k, aus)) = MEM.lock().unwrap().as_ref() {
+        if *k == key {
+            return Ok(aus.clone());
+        }
+    }
+    let dir = cache_dir();
+    let path = dir.join(format!("{key}.h264"));
+    let data = match tokio::fs::read(&path).await {
+        Ok(d) => {
+            info!("video: using cached clip {}", path.display());
+            d
+        }
+        Err(_) => {
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let tmp = dir.join(format!("{key}.tmp.h264"));
+            let frames = enc.settings.keyframe_interval.max(1);
+            let args = enc.build_args_out(None, Some((tmp.to_str().context("cache path")?, frames)));
+            let t0 = std::time::Instant::now();
+            info!("video: encoding a {frames}-frame clip once ({encoder:?}) → {}", path.display());
+            let status = Command::new("ffmpeg")
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .kill_on_drop(true)
+                .status()
+                .await
+                .context("spawning ffmpeg — is it installed?")?;
+            if !status.success() {
+                let _ = std::fs::remove_file(&tmp);
+                bail!("ffmpeg exited with {status} while encoding the clip");
+            }
+            std::fs::rename(&tmp, &path)?;
+            info!("video: clip encoded in {} ms", t0.elapsed().as_millis());
+            tokio::fs::read(&path).await?
+        }
+    };
+    let aus = match split_access_units(&data) {
+        Ok(aus) => Arc::new(aus),
+        Err(e) => {
+            // A broken cache file must not stick: drop it so the next start re-encodes.
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+    };
+    *MEM.lock().unwrap() = Some((key, aus.clone()));
+    Ok(aus)
+}
+
+/// Pre-encode the clip for the last display size the car asked for, in the
+/// background, so a session never waits for ffmpeg. No-op for live sources.
+pub fn prewarm() {
+    let (width, height) = last_display();
+    let enc = VideoEncoder::new(VideoSettings { width, height, ..Default::default() });
+    if Mode::for_source(&enc.source) != Mode::Static {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Err(e) = static_clip(&enc).await {
+            warn!("video: pre-encoding the {width}x{height} clip failed: {e:#}");
+        }
+    });
+}
+
+/// Split an Annex-B stream into access units (each Annex-B framed again), and
+/// make sure the first one is a decodable keyframe carrying SPS + PPS.
+fn split_access_units(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut parser = NalParser::new();
+    let mut nals = parser.push(data);
+    nals.extend(parser.push(&[0, 0, 0, 1])); // flush the last NAL
+    let (mut sps, mut pps) = (None, None);
+    let mut aus: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut cur: Vec<Vec<u8>> = Vec::new();
+    let mut cur_has_vcl = false;
+    for nal in nals {
+        let t = nal_type(&nal);
+        let is_vcl = (1..=5).contains(&t);
+        if t == 9 {
+            continue; // access unit delimiter
+        }
+        if cur_has_vcl && (!is_vcl || is_first_slice(&nal)) {
+            aus.push(std::mem::take(&mut cur));
+            cur_has_vcl = false;
+        }
+        match t {
+            7 => sps = Some(nal.clone()),
+            8 => pps = Some(nal.clone()),
+            _ => {}
+        }
+        cur_has_vcl |= is_vcl;
+        cur.push(nal);
+    }
+    if cur_has_vcl {
+        aus.push(cur);
+    }
+    let first = aus.first_mut().context("the clip has no frames")?;
+    if !first.iter().any(|n| nal_type(n) == 5) {
+        bail!("the clip does not start with an IDR frame");
+    }
+    // Make the IDR self-contained even if the encoder sent SPS/PPS elsewhere.
+    if !first.iter().any(|n| nal_type(n) == 8) {
+        first.insert(0, pps.context("the clip has no PPS")?);
+    }
+    if !first.iter().any(|n| nal_type(n) == 7) {
+        first.insert(0, sps.context("the clip has no SPS")?);
+    }
+    Ok(aus
+        .into_iter()
+        .map(|au| {
+            let mut out = Vec::new();
+            for nal in au {
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                out.extend_from_slice(&nal);
+            }
+            out
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,5 +1509,87 @@ mod avcc_trailer_tests {
         let pps = vec![0x68, 0xEE, 0x3C, 0x80];
         let iso_len = 6 + 2 + sps.len() + 1 + 2 + pps.len();
         assert_eq!(build_avcc_config(&sps, &pps).unwrap().len(), iso_len + 4);
+    }
+}
+
+#[cfg(test)]
+mod minimal_source_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn sources_parse() {
+        assert_eq!(Source::parse(None), Source::Dashboard);
+        assert_eq!(Source::parse(Some("test")), Source::Test);
+        assert_eq!(Source::parse(Some("fb")), Source::Framebuffer("/dev/fb0".into()));
+        assert_eq!(Source::parse(Some("fb:/dev/fb1")), Source::Framebuffer("/dev/fb1".into()));
+        assert_eq!(Source::parse(Some("image:/a.png")), Source::Image("/a.png".into()));
+        assert_eq!(Source::parse(Some("color:#102030")), Source::Color("102030".into()));
+        assert_eq!(
+            Source::parse(Some("ffmpeg:-f v4l2 -i /dev/video0")),
+            Source::Raw(vec!["-f".into(), "v4l2".into(), "-i".into(), "/dev/video0".into()])
+        );
+    }
+
+    #[test]
+    fn live_sources_never_use_the_static_clip() {
+        if std::env::var("RASCAR_VIDEO_MODE").is_err() {
+            assert_eq!(Mode::for_source(&Source::Test), Mode::Static);
+            assert_eq!(Mode::for_source(&Source::Framebuffer("/dev/fb0".into())), Mode::Live);
+            assert_eq!(Mode::for_source(&Source::Dashboard), Mode::Live);
+        }
+    }
+
+    #[test]
+    fn access_units_split_and_the_idr_gets_its_parameter_sets() {
+        // SPS, PPS, IDR | P | P, then a second GOP with an IDR but no SPS/PPS.
+        let nals: &[&[u8]] = &[&[0x67, 1, 2, 3], &[0x68, 4], &[0x65, 0x88, 1], &[0x41, 0x9a, 2], &[0x41, 0x9a, 3]];
+        let mut stream = Vec::new();
+        for n in nals {
+            stream.extend_from_slice(&[0, 0, 0, 1]);
+            stream.extend_from_slice(n);
+        }
+        let aus = split_access_units(&stream).unwrap();
+        assert_eq!(aus.len(), 3);
+        assert_eq!(aus[0], [&[0u8, 0, 0, 1, 0x67, 1, 2, 3][..], &[0, 0, 0, 1, 0x68, 4], &[0, 0, 0, 1, 0x65, 0x88, 1]].concat());
+        assert_eq!(aus[2], vec![0, 0, 0, 1, 0x41, 0x9a, 3]);
+        // No IDR at all: refused.
+        assert!(split_access_units(&[0, 0, 0, 1, 0x41, 0x9a, 2]).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replay_loops_at_the_frame_rate() {
+        let mut r = Replay::new(Arc::new(vec![vec![1; 10], vec![2; 3]]), 10);
+        let mut buf = [0u8; 4];
+        let t0 = tokio::time::Instant::now();
+        let mut got = Vec::new();
+        for _ in 0..5 {
+            let n = r.read(&mut buf).await;
+            got.extend_from_slice(&buf[..n]);
+        }
+        // 10-byte AU in 4+4+2, then the 3-byte AU, then the first AU again.
+        assert_eq!(got, [vec![1; 10], vec![2; 3], vec![1; 4]].concat());
+        assert_eq!(t0.elapsed(), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn a_still_source_scales_and_a_clip_is_not_paced() {
+        let mut enc = VideoEncoder::new(VideoSettings { width: 1200, height: 512, ..VideoSettings::default() });
+        enc.source = Source::Image("/x.png".into());
+        let live = enc.build_args().join(" ");
+        assert!(live.contains("-re -loop 1"), "live: paced to real time: {live}");
+        assert!(live.contains("scale=1200:512"));
+        assert!(live.ends_with("pipe:1"));
+        let clip = enc.build_args_out(None, Some(("/c.h264", 15))).join(" ");
+        assert!(!clip.contains("-re "), "a clip encodes as fast as possible");
+        assert!(clip.ends_with("-frames:v 15 -y /c.h264"), "{clip}");
+    }
+
+    #[test]
+    fn the_dashboard_is_still_the_default_capture() {
+        if std::env::var("RASCAR_VIDEO_SOURCE").is_err() {
+            let args = VideoEncoder::new(VideoSettings::default()).build_args().join(" ");
+            assert!(args.contains("-f x11grab"));
+        }
     }
 }
