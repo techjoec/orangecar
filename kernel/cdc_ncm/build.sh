@@ -47,7 +47,7 @@ done
 
 [[ $EUID -eq 0 ]] || die "run as root (it may prepare the kernel headers and installs into /lib/modules)"
 [[ -f $PATCH ]] || die "$PATCH missing"
-[[ -d $KDIR ]] || die "no kernel build tree at $KDIR — install the headers for $KREL (Armbian: apt install linux-headers-current-<family>, e.g. linux-headers-current-rockchip64)"
+[[ -d $KDIR ]] || die "no kernel build tree at $KDIR — install the headers for $KREL (Armbian: apt install linux-headers-current-<family>, e.g. linux-headers-current-rockchip64; Raspberry Pi OS on a Pi Zero W: apt install linux-headers-rpi-v6)"
 for t in make gcc patch curl; do
     command -v "$t" >/dev/null || die "$t missing (apt install build-essential patch curl)"
 done

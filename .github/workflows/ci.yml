@@ -20,6 +20,22 @@ jobs:
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace
 
+  # The minimal profile (docs/minimal.md): rascar-carplay alone for a Pi Zero W (ARMv6).
+  pizero-minimal:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: arm-unknown-linux-gnueabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: pip install ziglang && cargo install cargo-zigbuild
+      - run: cargo zigbuild --release --target arm-unknown-linux-gnueabihf.2.31 -p rascar-carplay
+      - name: Device-tree overlays
+        run: |
+          sudo apt-get update && sudo apt-get install -y device-tree-compiler
+          for f in pizero/overlays/*.dts; do dtc -@ -q -I dts -O dtb -o /dev/null "$f"; done
+
   frontend-and-scripts:
     runs-on: ubuntu-24.04
     steps:
@@ -29,7 +45,7 @@ jobs:
           find app/frontend/js app/chromium-ext -name '*.js' -print0 | xargs -0 -n1 node --check
       - name: Shell syntax
         run: |
-          grep -rlE '^#!.*(ba)?sh' setup tools kernel experimental/androidauto-setup | xargs -n1 bash -n
+          grep -rlE '^#!.*(ba)?sh' setup tools kernel pizero experimental/androidauto-setup | xargs -n1 bash -n
       - name: Python syntax
         run: |
           find . -name '*.py' -not -path './target/*' -print0 | xargs -0 python3 -m py_compile

@@ -100,6 +100,8 @@ default.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
+| `RASCAR_UDC` | `fc000000.usb` | OTG controller platform device (`20980000.usb` on a Raspberry Pi Zero). |
+| `RASCAR_ROLE_SWITCH_CMD` | unset | Run as `<cmd> host` / `<cmd> device` when none of the sysfs knobs takes the switch. |
 | `RASCAR_ROLE_SWITCH_DELAY_MS` | `10` (max 2000) | Delay between acknowledging the role switch and switching to host. |
 | `RASCAR_EARLY_NCM` | off (opt-in) | Bring the NCM link up during the iAP2 handshake instead of after authentication. |
 | `RASCAR_NCM_HOLD` | off (opt-in) | Use the patched module's `hold_apple_gadget` parameter to keep `cdc_ncm` off the car until iAP2 authentication is done. |
@@ -150,6 +152,11 @@ default.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
+| `RASCAR_VIDEO_SOURCE` | `dashboard` | Stream something other than the dashboard: `test`, `color:RRGGBB`, `image:PATH`, `fb[:/dev/fbN]`, `ffmpeg:ARGS` (no render; touches go to `RASCAR_EVENTS_ADDR`). See `docs/minimal.md`. |
+| `RASCAR_VIDEO_MODE` | `live` / `static` | `static` (default for still sources): encode one GOP once, cache, replay. `none`: no video, MainScreen stays the car's. |
+| `RASCAR_VIDEO_CACHE` | `/var/lib/rascar/video-cache` | Static clips and the last display size. |
+| `RASCAR_VIDEO_ENCODER` | probed | `x264`, `openh264`, or `v4l2m2m` (V4L2 hardware encoder, e.g. Raspberry Pi). |
+| `RASCAR_EVENTS_ADDR` | unset | `HOST:PORT` for car touches/keys as UDP text lines. |
 | `RASCAR_DISPLAY` | `:0` | X display the dashboard is rendered on and captured from. |
 | `RASCAR_COMPOSITOR` | unset (Xvfb) | `wayland` runs the dashboard in a headless Wayland kiosk on the GPU instead of Xvfb. |
 | `RASCAR_RENDER_NODE` | `/dev/dri/renderD128` | GPU render node for the Wayland kiosk. |

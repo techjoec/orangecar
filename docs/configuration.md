@@ -122,6 +122,21 @@ exact value given in their row.
 | `RASCAR_CAR_GPS_PATH` | `/var/lib/rascar-debug/car-gps.nmea` | file the car's NMEA sentences are appended to |
 | `NO_COLOR` | unset | `1`: no ANSI colours in the logs |
 
+### Minimal profile and other boards
+
+Used by [the minimal profile](minimal.md) (`pizero/carplay-minimal.env`). Unset, they keep the
+behaviour above.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `RASCAR_UDC` | `fc000000.usb` | OTG controller platform device (`20980000.usb` on a Pi Zero, `fe980000.usb` on a Pi 4) |
+| `RASCAR_ROLE_SWITCH_CMD` | unset | command run as `<cmd> host` / `<cmd> device` when no sysfs knob takes the role switch |
+| `RASCAR_VIDEO_SOURCE` | `dashboard` | `test`, `color:RRGGBB`, `image:PATH`, `fb[:/dev/fbN]`, `ffmpeg:ARGS`: stream that instead of the dashboard (no render, touches go to `RASCAR_EVENTS_ADDR`) |
+| `RASCAR_VIDEO_MODE` | `live` (dashboard), `static` (still sources) | `static`: encode one GOP once, cache it, replay it. `none`: no video at all, MainScreen stays the car's |
+| `RASCAR_VIDEO_CACHE` | `/var/lib/rascar/video-cache` | static clips, and the last display size (pre-encoded at start) |
+| `RASCAR_VIDEO_ENCODER` | probed (`x264`, else `openh264`) | `v4l2m2m` for a V4L2 hardware encoder (Raspberry Pi) |
+| `RASCAR_EVENTS_ADDR` | unset | `HOST:PORT`: send car touches/keys as UDP text lines (`touch down X Y`, `key next`) |
+
 ### Tuning and experiments
 
 These are kept for bringing up other head units and for A/B tests. The defaults are the configuration

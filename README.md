@@ -97,6 +97,10 @@ sudo setup/install.sh        # asks its questions up front; also builds the patc
 The full step-by-step guide is in **[docs/install.md](docs/install.md)**, and every setting is listed in
 [docs/configuration.md](docs/configuration.md).
 
+**Only need the iPhone side?** The [minimal profile](docs/minimal.md) runs `rascar-carplay` alone, with
+no dashboard and no audio, on a Raspberry Pi Zero W: the car sees a CarPlay iPhone and shows its own UI
+or a still picture (`pizero/`).
+
 ## Documentation
 
 | Document | Contents |
@@ -108,6 +112,7 @@ The full step-by-step guide is in **[docs/install.md](docs/install.md)**, and ev
 | [docs/protocol.md](docs/protocol.md) | **Wired CarPlay, phone side, step by step and byte by byte** |
 | [docs/reverse-engineering-notes.md](docs/reverse-engineering-notes.md) | How it was figured out, and how to debug your own car |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom → cause → fix |
+| [docs/minimal.md](docs/minimal.md) | Minimal profile: the iPhone side only, on a Raspberry Pi Zero W |
 | [docs/tested-vehicles.md](docs/tested-vehicles.md) | Cars known to work, and a template to add yours |
 | [docs/ota.md](docs/ota.md) | Optional self-hosted signed updates and log upload |
 | [tools/bench/README.md](tools/bench/README.md) | Test a CarPlay session on a PC, with a simulated head unit |
@@ -121,6 +126,7 @@ carplay/        rascar-carplay: the CarPlay transmitter (USB, iAP2, NCM, mDNS, A
 app/            rascar-app: dashboard backend (Rust/axum) and frontend (HTML/CSS/JS)
 agent/          rascar-agent: optional signed OTA updates and log upload
 setup/          board installer, systemd units, udev rules, helper scripts
+pizero/         minimal profile for a Raspberry Pi Zero W: dwc2 overlays, installer, unit, env
 kernel/cdc_ncm/ patch + build script for the CDC-NCM driver the car link needs
 tools/          release packaging, simulators, benchmarks
 experimental/   Android Auto source (dead end) and Android Auto head unit

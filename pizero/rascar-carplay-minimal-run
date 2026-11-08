@@ -1,0 +1,38 @@
+#!/bin/bash
+# rascar-carplay-minimal-run — one CarPlay attempt with the minimal profile.
+# systemd restarts it after every exit, so every plug-in gets a fresh attempt.
+# (The Orange Pi build uses setup/carplay-debug/rascar-carplay-run instead.)
+set -u
+
+BIN=${RASCAR_BIN:-/usr/local/bin/rascar-carplay}
+
+# Self-heal anything a previous attempt that died mid-way may have left behind.
+echo 1 > /sys/bus/usb/drivers_autoprobe 2>/dev/null || true
+modprobe cdc_ncm 2>/dev/null || true
+pkill -f "avahi-publish-service .*_carplay-ctrl" 2>/dev/null || true
+
+# A run that fails after the role switch can leave the port in host mode, and
+# the next gadget bind would fail: put it back in device mode first.
+for role in /sys/class/usb_role/*/role; do
+    [[ -w $role ]] || continue
+    if [[ $(cat "$role") != device ]]; then
+        echo "usb role was '$(cat "$role")' — resetting to device"
+        echo device > "$role" || true
+        sleep 1
+    fi
+done
+if [[ -n ${RASCAR_ROLE_SWITCH_CMD:-} ]] && dtoverlay -l 2>/dev/null | grep -q dwc2-host; then
+    "$RASCAR_ROLE_SWITCH_CMD" device || true
+fi
+
+if [[ $(cat /sys/module/cdc_ncm/version 2>/dev/null) != rascar-* ]]; then
+    echo "WARNING: the patched cdc_ncm is not loaded (kernel/cdc_ncm/build.sh, then reboot); the car's NCM link will likely fail"
+fi
+
+# IPv6 DAD off so the NCM link-local address is usable instantly.
+echo 0 > /proc/sys/net/ipv6/conf/default/accept_dad 2>/dev/null || true
+echo 0 > /proc/sys/net/ipv6/conf/default/dad_transmits 2>/dev/null || true
+
+DEBUG=()
+[[ ${RASCAR_DEBUG:-0} == 1 ]] && DEBUG=(--debug)
+exec "$BIN" "${DEBUG[@]}" "$@"
