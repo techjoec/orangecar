@@ -34,6 +34,7 @@ run_case() {
     local meeting=0 handback=0 sim_extra=()
     if [[ ${1:-} == MEETING=1 ]]; then meeting=1; sim_extra=(--expect-meeting); shift; fi
     if [[ ${1:-} == HANDBACK=1 ]]; then handback=1; sim_extra+=(--expect-handback); shift; fi
+    if [[ ${1:-} == NOFRAMES=1 ]]; then sim_extra+=(--min-frames 0); shift; fi
     if [[ ${1:-} == LATE_AUDIO=1 ]]; then sim_extra+=(--audio-setup-delay 3.2 --expect-media-audio); shift; fi
     echo "── $label"
     timeout $((RUN_SECS + 20)) python3 "$SIM" --port "$PORT" \
@@ -74,6 +75,15 @@ run_case meeting MEETING=1 RASCAR_CARPLAY_AUDIO=on
 run_case handback HANDBACK=1 RASCAR_CARPLAY_AUDIO=on
 # The car answers the audio SETUP 3.2 s late (2026-10-01): audio must still flow.
 run_case late_audio LATE_AUDIO=1 RASCAR_CARPLAY_AUDIO=on
+
+# The minimal "iPhone side only" profile (pizero/carplay-minimal.env): no
+# dashboard, no audio, a still picture encoded once and replayed.
+MINIMAL=(RASCAR_CARPLAY_AUDIO=off RASCAR_NOWPLAYING=off RASCAR_VIDEO_SOURCE=color:1d1d1f
+         RASCAR_VIDEO_MODE=static RASCAR_VIDEO_FPS=15 RASCAR_VIDEO_CACHE="$OUT/video-cache")
+run_case minimal "${MINIMAL[@]}"
+run_case minimal_handback HANDBACK=1 "${MINIMAL[@]}"
+# Minimal profile with no video at all: MainScreen stays the car's.
+run_case minimal_no_video NOFRAMES=1 "${MINIMAL[@]/RASCAR_VIDEO_MODE=static/RASCAR_VIDEO_MODE=none}"
 
 if [[ $fail -eq 0 ]]; then
     echo "RESULT: session survives in every configuration."

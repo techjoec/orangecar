@@ -670,11 +670,14 @@ def main():
     print("=" * 66)
 
     ok = True
-    expected = [("Request Main Audio", 0, ENTITY_ACCESSORY), ("Release Main Audio Request", 0, ENTITY_CONTROLLER)]
+    # After the car's release, MainAudio goes back to whoever owned it at the
+    # start: the phone if the sender claimed it, else the car itself.
+    home = STATS.audio_modes_history[0] if STATS.audio_modes_history else ENTITY_CONTROLLER
+    expected = [("Request Main Audio", 0, ENTITY_ACCESSORY), ("Release Main Audio Request", 0, home)]
     if STATS.change_modes_replies != expected:
         print(f"FAIL: the car's MainAudio borrow/release was not accepted as expected {expected}.")
         ok = False
-    expected_after = [("Request Main Audio", [ENTITY_ACCESSORY]), ("Release Main Audio Request", [ENTITY_CONTROLLER])]
+    expected_after = [("Request Main Audio", [ENTITY_ACCESSORY]), ("Release Main Audio Request", [home])]
     if STATS.modes_after_change != expected_after:
         print(f"FAIL: modesChanged after the car's changeModes {STATS.modes_after_change}, expected {expected_after}.")
         ok = False
