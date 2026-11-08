@@ -1,5 +1,10 @@
 # Tested vehicles
 
+> **Note:** written for the original Orange Pi 5 Plus build (RK3588, dwc3, Armbian). The protocol
+> findings apply unchanged to the Pi Zero W; paths under `setup/`, the dashboard and board-specific
+> details (dwc3 debugfs, fusb302, NVMe, thermal) no longer exist in this repository.
+
+
 OrangeCar has been tested end to end in **one car**. Every timer and quirk the code works around was
 measured on it. Other cars will differ, which is why reports are the most useful contribution right now
 (see [the template](#report-template) at the end of this page).

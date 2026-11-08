@@ -1,0 +1,8 @@
+# Keep the kernel name (usb0) for the car's CDC-NCM link: a late udev rename
+# "while UP" stalls the NCM bring-up.
+[Match]
+Driver=cdc_ncm
+
+[Link]
+NamePolicy=kernel
+MACAddressPolicy=none

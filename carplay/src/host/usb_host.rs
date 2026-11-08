@@ -2,7 +2,7 @@
 //! vendor bulk interface as a `tokio::io::AsyncRead + AsyncWrite` transport that
 //! Phase 2's [`crate::iap2::Iap2Device`] consumes.
 //!
-//! After [`super::role_switch::switch_to_host`] flips `fc000000.usb` to host
+//! After [`super::role_switch::switch_to_host`] flips the OTG controller to host
 //! mode, the car enumerates on our bus exposing (at least):
 //!   * a **vendor-specific** interface (class `0xFF`) carrying **iAP2** over a
 //!     bulk IN + bulk OUT endpoint pair, and
@@ -191,12 +191,11 @@ async fn scan_once(seen: &mut HashSet<String>) -> Result<Option<CarDevice>> {
     Ok(None)
 }
 
-/// True when `sysfs` is a device below the role-switched dwc3 controller
-/// (`/sys/devices/platform/fc000000.usb/xhci-hcd.N.auto/usbX/...`).
+/// True when `sysfs` is a device below the role-switched OTG controller
+/// (`/sys/devices/platform/soc/20980000.usb/usb1/1-1` on a Pi Zero).
 fn on_role_switched_controller(sysfs: &Path) -> bool {
-    sysfs
-        .components()
-        .any(|c| c.as_os_str() == super::role_switch::UDC_NAME)
+    let ctrl = super::role_switch::controller_name();
+    sysfs.components().any(|c| c.as_os_str() == ctrl.as_str())
 }
 
 /// Multi-line inventory of one enumerated device: identity, class, and each
@@ -610,12 +609,13 @@ mod tests {
 
     #[test]
     fn only_the_role_switched_port_can_be_the_car() {
-        // Where the car enumerated in every archived run.
-        let car = Path::new("/sys/devices/platform/fc000000.usb/xhci-hcd.8.auto/usb7/7-1");
-        // The 4G stick that was claimed as the car on 2026-09-29.
-        let stick = Path::new("/sys/devices/platform/fc880000.usb/usb3/3-1");
+        if std::env::var("RASCAR_UDC").is_ok() {
+            return;
+        }
+        let car = Path::new("/sys/devices/platform/soc/20980000.usb/usb1/1-1");
+        let stick = Path::new("/sys/devices/platform/soc/3f980000.usb/usb3/3-1");
         // A look-alike controller name must not match as a substring.
-        let lookalike = Path::new("/sys/devices/platform/fc000000.usb2/usb9/9-1");
+        let lookalike = Path::new("/sys/devices/platform/soc/20980000.usb2/usb9/9-1");
         assert!(on_role_switched_controller(car));
         assert!(!on_role_switched_controller(stick));
         assert!(!on_role_switched_controller(lookalike));

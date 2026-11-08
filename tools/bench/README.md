@@ -15,12 +15,10 @@ directly over TCP.
 
 ```bash
 cargo build --release -p rascar-carplay
-tools/bench/session_survival_test.sh            # 5 scenarios, ~2 minutes
+tools/bench/session_survival_test.sh            # 2 scenarios, ~1 minute
 ```
 
-Each scenario must keep the session alive past 15 s with at least 100 video frames. Expected output ends
-with `RESULT: session survives in every configuration.` The sender opens a kiosk on display `:0`, so run
-it from a desktop session (or start `Xvfb :0` first).
-
-The released code passes all five scenarios, with the same lifetimes and frame counts as the build that
-runs in the reference car.
+Two scenarios (screen only, and a screen hand-back to the car's UI and back). Each must keep the session
+alive past 15 s with at least 100 video frames. Expected output ends with
+`RESULT: session survives in every configuration.` Needs `ffmpeg` with `libx264` and IPv6 (the sender
+binds its timing socket on `[::]`).

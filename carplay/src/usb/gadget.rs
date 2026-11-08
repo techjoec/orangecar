@@ -1,6 +1,6 @@
 //! USB Gadget setup via configfs + FunctionFS — Apple-device identity.
 //!
-//! Configures the OrangePi 5 Plus USB-C OTG port to enumerate to the car head
+//! Configures the Pi Zero W micro-USB OTG port to enumerate to the car head
 //! unit as a real-iPhone-shaped **Apple iPhone**: four configurations, each backed
 //! by its own FunctionFS instance, high speed.  The layout mirrors a
 //! hardware-proven FunctionFS probe (four iPhone-shaped configurations, padded
@@ -10,7 +10,7 @@
 //! it never collides with the `rascar` Android Auto gadget.
 //!
 //! Requires:
-//!   - rk3588-dwc3-peripheral overlay (UDC `fc000000.usb`)
+//!   - dwc2 in OTG mode (`pizero/overlays/dwc2-role-switch.dts`, UDC `20980000.usb`)
 //!   - Kernel modules: libcomposite, usb_f_fs
 //!   - Root privileges
 
@@ -191,7 +191,7 @@ fn load_modules() -> Result<()> {
 fn find_udc() -> Result<String> {
     let udc_dir = Path::new("/sys/class/udc");
     if !udc_dir.exists() {
-        anyhow::bail!("no /sys/class/udc — is the dwc3 peripheral overlay loaded?");
+        anyhow::bail!("no /sys/class/udc — is dwc2 loaded (dtoverlay=dwc2-role-switch)?");
     }
     let mut names: Vec<String> = fs::read_dir(udc_dir)?
         .filter_map(|e| e.ok())
@@ -199,7 +199,7 @@ fn find_udc() -> Result<String> {
         .collect();
     names.sort();
     let name = names.first().cloned().ok_or_else(|| {
-        anyhow::anyhow!("no UDC available. Ensure the rk3588-dwc3-peripheral overlay is enabled")
+        anyhow::anyhow!("no UDC available. Ensure dtoverlay=dwc2-role-switch is in config.txt")
     })?;
     if names.len() > 1 {
         warn!("multiple UDCs present {names:?} — using {name} (set the peripheral overlay if wrong)");

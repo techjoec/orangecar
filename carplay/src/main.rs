@@ -1,31 +1,16 @@
-//! RasCar CarPlay Transmitter — Main Orchestrator (Path A, Phase 1).
+//! Minimal CarPlay "iPhone" for a Raspberry Pi Zero W — orchestrator.
 //!
-//! # What this is
+//! The Pi plugs into a car's wired CarPlay USB port and plays the phone:
 //!
-//! Path A of the CarPlay transmitter: the OrangePi 5 Plus impersonates an Apple
-//! iPhone to a car head unit over USB, so the car starts its CarPlay attach
-//! sequence towards us instead of Android Auto.  The car performs **no MFi/cert
-//! check on the device** at attach time (primary-source verified), which is why
-//! impersonating the USB identity is viable.
-//!
-//! # Phase 1 scope (this binary)
-//!
-//! - Enumerate to the car as an **Apple device** (VID 0x05AC "Apple Inc.",
-//!   PID 0x12A8 "iPhone", USB 2.00) via configfs + FunctionFS.
-//! - Capture and LOG every ep0 control request the car issues, and specifically
-//!   recognise the **CarPlay USB role-switch vendor request**
-//!   (`bRequest=0x51`, `bmRequestType=0x40`, `wValue=1`, plus the `0x53`/`0xC0`
-//!   read variant).
-//!
-//! Phase 1 is a *capture / proof-of-reachability* milestone.  We do **not**
-//! implement iAP2, CDC-NCM, AirPlay, or the actual device→host controller role
-//! transition here — those are later phases (see below).
-//!
-//! # Roadmap (not in this binary)
-//!   - Phase 2: iAP2 link layer over USB (Device-side identify / accept-all auth)
-//!   - Phase 3: USB host role transition + CDC-NCM tunnel + IPv6 LL + Bonjour
-//!   - Phase 4: AirPlay pair + FairPlay SAP (GO/NO-GO gate)
-//!   - Phase 5: HEVC/H.264 dashboard encode + AirPlay sender + HID touch
+//!   1. enumerate as an Apple iPhone (configfs + FunctionFS) and answer ep0
+//!      until the car sends the CarPlay role-switch request (`40 51 wValue=1`);
+//!   2. flip the dwc2 OTG port to USB host and enumerate the car;
+//!   3. run the device side of iAP2 (identify, accept-all authentication) and
+//!      bring up the CDC-NCM link (IPv6 link-local, `_carplay-ctrl` mDNS);
+//!   4. open the CarPlay session over RTSP (pair, SETUP, /info, RECORD,
+//!      modesChanged);
+//!   5. stream an H.264 picture to the car's screen; car touches and keys come
+//!      back as text lines on UDP (`stream::events`).
 //!
 //! Protocol notes: `docs/protocol.md` at the repository root.
 //!
@@ -34,7 +19,7 @@
 //! ```bash
 //! sudo cargo run --bin rascar-carplay -- --debug
 //! ```
-//! Requires root (configfs / FunctionFS) and the rk3588-dwc3-peripheral overlay.
+//! Requires root (configfs / FunctionFS) and dwc2 in OTG mode with the usb-role-switch overlay.
 //!
 //! # Debug instrumentation
 //!
@@ -47,8 +32,6 @@
 
 mod airplay;
 mod debug;
-mod gps_clock;
-mod headunit;
 mod host;
 mod iap2;
 mod ntp_time;
@@ -72,28 +55,11 @@ use usb::{ffs, gadget};
 pub const DEVICE_MAC: &str = "d0:81:7a:c0:ff:ee";
 
 #[derive(Parser)]
-#[command(name = "rascar-carplay", about = "RasCar CarPlay Transmitter (Phase 1: Apple enumeration + role-switch capture)")]
+#[command(name = "rascar-carplay", about = "Minimal CarPlay \"iPhone\" for a Raspberry Pi Zero W")]
 struct Cli {
     /// Enable debug logging (per-request hex, descriptor byte counts).
     #[arg(long)]
     debug: bool,
-
-    /// Skip Phases 1-3 (USB gadget, role switch, iAP2, mDNS) and run the
-    /// AirPlay handshake + streaming directly against `HOST:PORT`.
-    ///
-    /// This is the bench entry point: Phases 1-3 need the board, a USB role
-    /// switch and a car, none of which exist on a laptop. Phases 4-5 need only
-    /// a TCP peer, so pointing this at a local AirPlay receiver runs the whole
-    /// real sender path — render, x11grab, H.264, mirror packetisation,
-    /// encryption, RTSP — with no hardware.
-    ///
-    ///   rascar-carplay --airplay-endpoint 127.0.0.1:7000
-    ///
-    /// Against UxPlay you get a picture (it renders H.264) but NO proof of the
-    /// FairPlay transform — it accepts any m3. Against doubletake's
-    /// `cmd/doubletake-test-receiver` you get no picture but a real m3 check.
-    #[arg(long, value_name = "HOST:PORT")]
-    airplay_endpoint: Option<String>,
 
     /// Bench: skip Phases 1-3 and run the **CarPlay** session (`run_carplay` —
     /// SETUP /setup → 466?→pair(3939) → GET /info → RECORD → modesChanged →
@@ -111,11 +77,6 @@ struct Cli {
     #[arg(long, value_name = "LINKLOCAL%IFACE")]
     mdns_selftest: Option<String>,
 
-    /// Bench: run the car-audio capture for 3 s exactly as a CarPlay session
-    /// would (same PulseAudio discovery, same default-output monitor), print
-    /// what it found and how loud the captured audio was, then exit.
-    #[arg(long)]
-    audio_probe: bool,
 }
 
 #[tokio::main]
@@ -135,16 +96,8 @@ async fn main() -> Result<()> {
 
     log_startup_banner(cli.debug);
 
-    if cli.audio_probe {
-        return audio_probe().await;
-    }
-
-    // Bench path: skip straight to the AirPlay phases against a TCP peer.
-    // Deliberately reuses `airplay::run` + `stream::run` unchanged, so what runs
-    // here is the same code that runs at a car — only Phases 1-3 are absent.
-    if let Some(target) = cli.airplay_endpoint.clone() {
-        return run_airplay_only(&target).await;
-    }
+    // Bench path: run the real CarPlay session code against a TCP peer; only
+    // Phases 1-3 (USB, role switch, iAP2, mDNS) are absent.
     if let Some(target) = cli.carplay_endpoint.clone() {
         return run_carplay_only(&target).await;
     }
@@ -156,35 +109,6 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Pre-warm the video render pipeline (Xvfb + Chromium) NOW, before the ~6 s USB
-    // handshake, so it is painting by the time Phase 4/5 reaches screen SETUP. The
-    // car tears the CarPlay session down at a FIXED ~7.8 s from enumeration; cold-
-    // starting Chromium at screen SETUP (the end of the RTSP handshake) never yields
-    // a keyframe in time. Held for the process lifetime; run_carplay's own
-    // ensure_dashboard then finds this X server up and reuses it (instant ffmpeg
-    // keyframe). 1200×512 matches the Jaguar F-PACE display negotiated at /info.
-    //
-    // Bounded: it runs BEFORE the USB gadget exists, so a render start that
-    // hangs keeps the car from ever seeing us (2026-09-30 drive 3: a wedged
-    // compositor + unbounded wlr-randr, no connection all drive). Past the cap
-    // the half-started kiosk is dropped (killed) and screen SETUP cold-starts.
-    let _render_prewarm = match tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        stream::render::ensure_dashboard(1200, 512),
-    )
-    .await
-    {
-        Ok(Ok(guard)) => Some(guard),
-        Ok(Err(e)) => {
-            warn!("render pre-warm failed (will cold-start at screen SETUP): {e:#}");
-            None
-        }
-        Err(_) => {
-            warn!("render pre-warm did not finish within 20 s — dropped, carrying on with the USB start (will cold-start at screen SETUP)");
-            None
-        }
-    };
-
     // Advertise `_carplay-ctrl._tcp` NOW, before the USB handshake, so avahi has
     // probed + committed the record long before the car browses it (~t+3 s) and can
     // answer authoritatively on the NCM link the instant it appears. Held for the
@@ -192,18 +116,13 @@ async fn main() -> Result<()> {
     // `_carplay-ctrl` in time.
     let _ctrl_adv = host::ctrl_advertise::spawn();
 
-    // Android persona probe (RASCAR_PERSONA=android): no Apple gadget at all.
-    if usb::aoa_probe::enabled() {
-        return usb::aoa_probe::run().await;
-    }
-
     info!("=== RasCar CarPlay Transmitter — Phase 1 (Apple enumeration + role-switch capture) ===");
 
     // Phase 1a: USB gadget + FunctionFS setup, presenting an Apple iPhone identity.
     info!("=== Phase 1a: USB Gadget Setup (Apple iPhone identity) ===");
     let phase = PhaseTimer::start("1a");
     let created = gadget::create()
-        .context("gadget setup failed — ensure the rk3588-dwc3-peripheral overlay is enabled and run as root");
+        .context("gadget setup failed — ensure dtoverlay=dwc2-role-switch is enabled and run as root");
     phase.end(&created);
     created?;
 
@@ -302,24 +221,9 @@ async fn run_gadget_session() -> Result<()> {
     info!("Plug the Pi into the car's USB port. Expected log milestones: UDC speed=high-speed, FFS event ENABLE [c.2], C0 53 answered, then '**** CARPLAY ROLE-SWITCH REQUEST ****'.");
 
     let phase = PhaseTimer::start("1d");
-    // Opt-in (RASCAR_IAP2_HID=1): answer the car's device-mode iAP2 over HID, the
-    // path a never-seen serial gets before any CarPlay role switch (InControl).
-    let hid_iap2 = if usb::hid_iap2::enabled() {
-        info!("RASCAR_IAP2_HID on: device-mode iAP2-over-HID responder started on {}", usb::hid_iap2::HID_IN_EP);
-        let challenge = random_challenge().context("generating the HID-mode auth challenge")?;
-        Some(tokio::spawn(usb::hid_iap2::run_device_mode(challenge)))
-    } else {
-        None
-    };
     // Consumes the set: every ep0 fd is closed when this returns.
     let capture = ffs::capture_control_requests(ep0s, udc).await;
     phase.end(&capture);
-    if let Some(task) = hid_iap2 {
-        task.abort();
-        ffs::set_hid_iap2_sink(None);
-        info!("device-mode iAP2-over-HID responder stopped (Phase 1d ended)");
-    }
-
     match capture {
         // All ep0 fds are closed; Phase 3 fully removes the gadget before the switch.
         Ok(ffs::CaptureOutcome::RoleSwitchRequested) => run_phase3_and_iap2().await,
@@ -924,63 +828,6 @@ fn parse_bench_endpoint(target: &str, flag: &str) -> Result<host::ncm::AirPlayEn
     })
 }
 
-async fn run_airplay_only(target: &str) -> Result<()> {
-    let (address, port) = target
-        .rsplit_once(':')
-        .context("--airplay-endpoint must be HOST:PORT")?;
-    let port: u16 = port
-        .parse()
-        .with_context(|| format!("--airplay-endpoint: bad port {port:?}"))?;
-    // Strip the brackets of a literal IPv6 form; `resolve_endpoint` wants the
-    // bare address plus a separate scope.
-    let address = address.trim_start_matches('[').trim_end_matches(']');
-
-    // A bare link-local needs a scope. Accept `fe80::1%enx0` and split it out so
-    // the endpoint carries the interface the same way a discovered one does.
-    let (address, interface) = match address.split_once('%') {
-        Some((addr, scope)) => (addr.to_string(), scope.to_string()),
-        None => (address.to_string(), String::new()),
-    };
-
-    let ep = host::ncm::AirPlayEndpoint {
-        service_type: "_airplay._tcp".to_string(),
-        name: format!("manual:{address}"),
-        host: address.clone(),
-        address,
-        port,
-        interface,
-    };
-
-    warn!(
-        "BENCH MODE — Phases 1-3 skipped (no USB gadget, no role switch, no iAP2, no mDNS). \
-         This exercises the real Phase 4/5 code against {}:{}, but proves NOTHING about the \
-         USB or iAP2 layers, and a receiver that rubber-stamps fp-setup proves nothing about \
-         FairPlay either.",
-        ep.address, ep.port
-    );
-
-    let (width, height) = (800u32, 480u32);
-    info!("=== Phase 4: AirPlay pair + FairPlay SAP (bench) ===");
-    let phase = PhaseTimer::start("4");
-    let handshake = airplay::run(&ep, width, height)
-        .await
-        .context("Phase 4 (bench): AirPlay handshake");
-    phase.end(&handshake);
-    let (sender, session) = handshake?;
-    info!(
-        "**** Phase 4 SUCCESS **** dataPort={} display={:?}",
-        session.data_port, session.display
-    );
-
-    info!("=== Phase 5: dashboard capture + AirPlay video sender (bench) ===");
-    let phase = PhaseTimer::start("5");
-    let streamed = stream::run(sender, session)
-        .await
-        .context("Phase 5 (bench): streaming session");
-    phase.end(&streamed);
-    streamed
-}
-
 #[cfg(test)]
 mod tuning_knob_tests {
     use super::*;
@@ -1011,30 +858,3 @@ mod tuning_knob_tests {
     }
 }
 
-/// `--audio-probe`: capture 3 s of what the car would receive and report it.
-async fn audio_probe() -> Result<()> {
-    let pulse = stream::audio::PulseEnv::discover();
-    println!("pulse server: {} (cookie {})", pulse.server(), pulse.cookie);
-    println!("default output monitor: {:?}", pulse.default_monitor().await);
-    let device = std::env::var("RASCAR_AUDIO_SOURCE").ok().filter(|s| !s.is_empty());
-    let mut cap = stream::audio::AudioCapture::new(48_000, 2);
-    cap.start(device.as_deref()).await?;
-    let mut buf = vec![0u8; 16384];
-    let (mut bytes, mut sq) = (0usize, 0f64);
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while std::time::Instant::now() < until {
-        let n = tokio::time::timeout(std::time::Duration::from_secs(1), cap.read_chunk(&mut buf)).await??;
-        if n == 0 {
-            anyhow::bail!("capture ended after {bytes} bytes");
-        }
-        for ch in buf[..n].chunks_exact(2) {
-            let s = i16::from_be_bytes([ch[0], ch[1]]) as f64;
-            sq += s * s;
-        }
-        bytes += n;
-    }
-    cap.stop().await;
-    let rms = (sq / (bytes / 2).max(1) as f64).sqrt();
-    println!("captured {bytes} bytes in 3 s (expected ~576000), RMS {rms:.0} ({})", if rms > 30.0 { "sound" } else { "silence" });
-    Ok(())
-}

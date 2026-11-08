@@ -1,148 +1,171 @@
-# OrangeCar
+# Pi Zero CarPlay "iPhone"
 
-**An Orange Pi that plugs into your car's CarPlay port and pretends to be an iPhone, so the car shows
-your own dashboard.**
+**A Raspberry Pi Zero W that plugs into a car's wired CarPlay port and plays the iPhone.**
 
-OrangeCar turns an Orange Pi 5 Plus (RK3588) into the *phone side* of **wired Apple CarPlay**. The car
-believes an iPhone is connected. What it actually displays is a web dashboard running on the board:
-offline navigation, music, OBD-II engine data, trips and fuel, 4G, phone calls. You control it from the
-car's touchscreen and steering-wheel buttons.
+This is a stripped-down version of OrangeCar, an Orange Pi 5 Plus that did the same job with a full
+dashboard. All that is left is the part that convinces the car a CarPlay iPhone is connected, and
+then streams a picture to the car's screen:
 
-You don't need an iPhone, an MFi authentication chip or a jailbreak. The project has run end to end in
-a production car (Jaguar F-PACE, InControl head unit) for daily driving.
+- the Pi enumerates as an Apple iPhone on its USB OTG port;
+- it answers the car's CarPlay role-switch request and becomes USB host;
+- it runs the phone side of iAP2 (identification, authentication) and brings up the CDC-NCM link;
+- it opens a CarPlay session (RTSP, pairing, modes) and streams H.264 video to the car screen;
+- touches and steering-wheel keys from the car come back as text lines on UDP.
 
-<p align="center">
-  <img src="docs/images/screenshot-home.png" width="800" alt="OrangeCar home screen as shown on the car display (1200x512)">
-</p>
-<p align="center">
-  <img src="docs/images/screenshot-engine.png" width="395" alt="Engine screen: live OBD-II gauges">
-  <img src="docs/images/screenshot-apps.png" width="395" alt="Applications screen">
-</p>
-<p align="center"><sub>Screenshots taken at the car's native 1200x512 resolution, with simulated data.</sub></p>
+The dashboard, maps, music, OBD-II, 4G, phone calls, Now Playing, OTA updates and the Android Auto
+experiments are gone. Audio was removed too: this build never claims the car's audio, so the radio
+keeps playing.
 
-> **Why this exists.** Projects that implement the *receiver* side of CarPlay (head units, dongle
-> firmware) exist. A working, open, end-to-end *transmitter* that a real car accepts did not seem to.
-> Getting there meant reverse-engineering USB role switching, iAP2 over USB, the CDC-NCM tunnel, the
-> car's timers and the CarPlay session itself. All of it is written down in
-> [docs/protocol.md](docs/protocol.md), so you don't have to repeat it.
+You don't need an iPhone, an MFi chip or a jailbreak. The car authenticates *itself* to the phone,
+so the phone side has nothing to prove.
 
-## What it does
+> **Status: untested on a Pi Zero in a car.** The protocol code is the code that ran end to end in a
+> Jaguar F-PACE (Harman InControl) on an Orange Pi 5 Plus. Two parts are new and need the hardware
+> to verify: the dwc2 role switch on the Pi Zero and the Pi's hardware H.264 encoder. The session
+> passes the bench simulator (`tools/bench/`). Please report what happens with your car.
 
-| On the car screen | Behind it |
-|---|---|
-| Home: clock, speed, next turn, range, now playing | GPS from the **car itself** over iAP2, OBD-II over Bluetooth |
-| Navigation | Offline MapLibre vector maps + Valhalla routing on the board, live traffic optional |
-| Music | YouTube Music, internet radio, lyrics, visualiser. Audio goes to the car speakers through CarPlay audio streams |
-| Engine | Live OBD-II PIDs, trouble codes, misfires, emission monitors, health checks |
-| Trips & fuel | Automatic trip log, fuel used per trip, a "fuel wallet" that learns from your refills |
-| 4G | SIMCom SIM7600 modem: data, signal, usage per day and billing cycle |
-| Phone | Calls through the 4G modem using the car's microphone and speakers (experimental) |
-| Steering wheel | Next/previous/play/pause and phone keys reach the dashboard |
-| Now Playing | The car's own media display shows the current track |
-| Home (optional) | Tiles for your own home-automation server, through a small documented HTTP contract. Hidden unless configured |
+## What you need
 
-## How it works (one paragraph)
+- **Raspberry Pi Zero W** (or Zero / Zero 2 W; any Pi whose OTG port is driven by `dwc2`).
+- A micro-SD card with **Raspberry Pi OS Lite (Bookworm, 32-bit)**.
+- A **micro-USB data cable** from the Pi's **USB** port (not `PWR IN`) to the car's CarPlay USB
+  port. That port also powers the Pi, because on the Zero the data port's VBUS feeds the 5 V rail.
+  Optional: power `PWR IN` from a separate 5 V supply, so the Pi is booted before the car looks.
+- A Linux or macOS PC to cross-compile the binary.
 
-The board's USB-C port starts in **device mode** and enumerates as an Apple iPhone. The car sends
-Apple's vendor **role-switch** request, the board flips to **USB host**, and the car's head unit
-re-appears as a USB device. Over that link the board speaks **iAP2** as the phone: identification,
-authentication and the control session. In parallel it brings up a **CDC-NCM** network with IPv6
-link-local addresses and finds the car over **mDNS**. It then opens a **CarPlay (AirPlay) session**
-over RTSP. The dashboard, rendered by a kiosk Chromium, is encoded to H.264 and streamed to the car's
-screen. Audio streams go both ways, and touches come back as HID reports.
+## Build (on a PC)
 
-```
- ┌────────────── Car head unit ───────────────┐
- │  USB host ──► sees an "iPhone"              │
- │     │   role switch (0x51)                  │
- │     ▼                                       │
- │  becomes a USB *device*: iAP2 + CDC-NCM     │
- └─────┬───────────────────────────────────────┘
-       │ USB-C (board OTG port)
- ┌─────▼──────── Orange Pi 5 Plus ─────────────┐
- │ rascar-carplay  USB gadget → host, iAP2,    │
- │                 NCM/mDNS, RTSP, H.264,      │
- │                 audio, touch                │
- │       ▲  screen capture + input             │
- │ kiosk (Chromium on cage/Wayland)            │
- │       ▲  http://localhost:8080              │
- │ rascar-app      dashboard API: GPS, OBD,    │
- │                 media, maps, 4G, trips      │
- └─────────────────────────────────────────────┘
-```
-
-More in [docs/architecture.md](docs/architecture.md).
-
-## Hardware
-
-Minimal: an **Orange Pi 5 Plus**, an **NVMe SSD**, a **stable 5 V supply** (the car's USB port is
-not enough) and a **USB-C cable** to the car's CarPlay port. Optional: an ELM327 Bluetooth OBD-II adapter,
-a USB Bluetooth dongle, a SIMCom SIM7600 4G modem, a fan. You don't need a GPS receiver: the car
-provides the position.
-
-Full parts list, wiring and power notes: **[docs/hardware.md](docs/hardware.md)**.
-
-## Quick start
+The Pi Zero W is ARMv6 (`armv6l`). Use the `arm-unknown-linux-gnueabihf` target: the armv7 target
+builds a binary that crashes on a Zero.
 
 ```bash
-# 1. Flash Armbian (Debian trixie, "current" kernel) for the Orange Pi 5 Plus to the NVMe and boot it.
-# 2. On a PC, cross-compile (recommended: never compile on the board while it runs on car power)
-git clone https://github.com/sbuysse/orangecar && cd orangecar
-cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.36 -p rascar-app -p rascar-carplay -p rascar-agent
-# 3. Copy the tree and the binaries to the board (see docs/install.md §4), then on the board:
-sudo setup/install.sh        # asks its questions up front; also builds the patched cdc_ncm module
-# 4. Reboot, plug the board's USB-C OTG port into the car's CarPlay port, start the car.
+rustup target add arm-unknown-linux-gnueabihf
+pip install ziglang && cargo install cargo-zigbuild
+cargo zigbuild --release --target arm-unknown-linux-gnueabihf.2.31 -p rascar-carplay
+# -> target/arm-unknown-linux-gnueabihf/release/rascar-carplay  (~2.5 MB)
 ```
 
-The full step-by-step guide is in **[docs/install.md](docs/install.md)**, and every setting is listed in
-[docs/configuration.md](docs/configuration.md).
+## Install (on the Pi)
 
-## Documentation
+Copy the repository and the binary to the Pi, then:
 
-| Document | Contents |
+```bash
+sudo pizero/install.sh target/arm-unknown-linux-gnueabihf/release/rascar-carplay
+sudo reboot
+```
+
+`install.sh`:
+
+1. installs `ffmpeg`, `avahi-daemon`/`avahi-utils`, `iproute2` and the kernel headers;
+2. builds `pizero/overlays/dwc2-role-switch.dts` into the boot partition and sets
+   `dtoverlay=dwc2-role-switch` in `config.txt`. This puts `dwc2` in OTG mode **with a software USB
+   role switch**, which is how the Pi turns from USB device into USB host when the car asks;
+3. loads `libcomposite` and `usb_f_fs` at boot and keeps NetworkManager and udev off the car's
+   network link;
+4. installs `/usr/local/bin/rascar-carplay`, the `rascar-carplay.service` systemd unit and
+   `/etc/rascar/carplay.env`;
+5. builds the **patched `cdc_ncm` kernel module** (`kernel/cdc_ncm/`). The stock driver cannot bring
+   up the car's network link (see `kernel/README.md`). This takes several minutes on a Zero.
+
+After the reboot, check:
+
+```bash
+ls /sys/class/usb_role                 # 20980000.usb-role-switch
+cat /sys/class/usb_role/*/role         # device
+cat /sys/module/cdc_ncm/version        # rascar-3
+ffmpeg -hide_banner -encoders | grep h264_v4l2m2m
+```
+
+If `/sys/class/usb_role` is empty, your kernel was built without `CONFIG_USB_ROLE_SWITCH`. Set
+`RASCAR_ROLE_SWITCH_CMD=/usr/local/sbin/rascar-role-switch-rebind` in `/etc/rascar/carplay.env`.
+That fallback unbinds `dwc2`, applies a `dr_mode=host` runtime overlay and binds it again. It is
+slower and less tested.
+
+Plug the Pi into the car and watch:
+
+```bash
+journalctl -fu rascar-carplay
+```
+
+The milestones, in order: `FFS event ENABLE`, `CARPLAY ROLE-SWITCH REQUEST`, `ROLE-SWITCH RESULT`,
+`SessionReady`, `← RECORD OK`, `→ VideoConfig`, `→ keyframe`, `frames streamed to car`.
+
+## What's on the screen
+
+Set `RASCAR_VIDEO_SOURCE` in `/etc/rascar/carplay.env`:
+
+| Value | Picture |
 |---|---|
-| [docs/hardware.md](docs/hardware.md) | Bill of materials, wiring, power, cooling |
-| [docs/install.md](docs/install.md) | From a blank SSD to a working car install |
-| [docs/configuration.md](docs/configuration.md) | Every file in `/etc/rascar` and every `RASCAR_*` variable |
-| [docs/architecture.md](docs/architecture.md) | Services, data flow, boot sequence |
-| [docs/protocol.md](docs/protocol.md) | **Wired CarPlay, phone side, step by step and byte by byte** |
-| [docs/reverse-engineering-notes.md](docs/reverse-engineering-notes.md) | How it was figured out, and how to debug your own car |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom → cause → fix |
-| [docs/tested-vehicles.md](docs/tested-vehicles.md) | Cars known to work, and a template to add yours |
-| [docs/ota.md](docs/ota.md) | Optional self-hosted signed updates and log upload |
-| [tools/bench/README.md](tools/bench/README.md) | Test a CarPlay session on a PC, with a simulated head unit |
-| [carplay/README.md](carplay/README.md), [app/README.md](app/README.md) | Crate-level details |
-| [experimental/README.md](experimental/README.md) | The Android Auto attempts (source and head unit) |
+| `test` (default) | a moving test card, so you can see the stream is live |
+| `color:1d1d1f` | a solid colour (the cheapest source) |
+| `image:/etc/rascar/screen.png` | a still image, scaled to the car's screen |
+| `fb` or `fb:/dev/fb0` | the Pi's framebuffer: draw anything there (a console, an SDL/fbdev app) |
+| `ffmpeg:<args>` | raw ffmpeg input arguments, e.g. `ffmpeg:-f v4l2 -i /dev/video0` for a camera |
+
+Every source is scaled to the display size the car reports, and encoded with the Pi's hardware H.264
+encoder (`h264_v4l2m2m`). Other knobs: `RASCAR_VIDEO_FPS` (15), `RASCAR_VIDEO_BITRATE_KBPS` (2000),
+`RASCAR_VIDEO_KEYINT` (15), `RASCAR_VIDEO_ENCODER` (`v4l2m2m` / `x264` / `openh264`).
+
+## Touch and buttons
+
+Car input is sent as one UDP datagram per event to `RASCAR_EVENTS_ADDR` (default `127.0.0.1:7705`),
+in pixels of the encoded picture:
+
+```text
+touch down 412 233
+touch move 415 240
+touch up 415 240
+key next
+```
+
+Key names: `play`, `pause`, `play-pause`, `next`, `previous`, `stop`, `hook`, `drop`. Try
+`nc -ulk 7705` on the Pi. Whatever draws the picture (for example an app on `/dev/fb0` with
+`RASCAR_VIDEO_SOURCE=fb`) can listen there.
+
+`printf 'screen car' > /dev/udp/127.0.0.1/7704` hands the car screen back to the car's own UI.
+Pressing the CarPlay icon on the car (or `screen phone`) takes it back.
+
+## Limits on a Pi Zero W
+
+- **Timing.** The tested car tears the session down if the first keyframe is late (about 7.8 s from
+  USB enumeration). ffmpeg starts at screen SETUP, and on a Zero it starts slowly. If the session dies
+  right after `screen SETUP`, lower the resolution cost: `RASCAR_VIDEO_SOURCE=color:…` and
+  `RASCAR_VIDEO_FPS=10`.
+- **Boot time.** A Zero takes ~30 s to boot. If the car powers it, the car may give up before the Pi
+  is ready. Unplug and replug, or power the Pi separately.
+- **USB endpoints.** The Pi's dwc2 has 7 device endpoints. The largest iPhone configuration needs 7.
+  It should fit; if the car never selects a configuration, report it.
+- Wired CarPlay only. No audio, no Siri, no Now Playing.
+
+## Bench test (no car, no Pi)
+
+```bash
+cargo build --release -p rascar-carplay
+tools/bench/session_survival_test.sh
+```
+
+This runs the real CarPlay session against a simulated head unit over TCP (USB, iAP2 and NCM are
+skipped) and checks that it stays alive with video flowing, including a screen hand-back. It needs
+`ffmpeg` with `libx264` and IPv6 on the PC.
 
 ## Repository layout
 
 ```
-carplay/        rascar-carplay: the CarPlay transmitter (USB, iAP2, NCM, mDNS, AirPlay, streams)
-app/            rascar-app: dashboard backend (Rust/axum) and frontend (HTML/CSS/JS)
-agent/          rascar-agent: optional signed OTA updates and log upload
-setup/          board installer, systemd units, udev rules, helper scripts
+carplay/        rascar-carplay: USB gadget, role switch, iAP2, NCM/mDNS, CarPlay session, H.264 stream
+pizero/         Pi Zero W setup: dwc2 overlays, install script, systemd unit, env example
 kernel/cdc_ncm/ patch + build script for the CDC-NCM driver the car link needs
-tools/          release packaging, simulators, benchmarks
-experimental/   Android Auto source (dead end) and Android Auto head unit
-docs/           everything above
+tools/bench/    CarPlay receiver simulator and the session survival test
+docs/           protocol notes from the original Orange Pi build (still valid for the protocol)
 ```
 
-## Status and limits
-
-- Tested on one car model (Jaguar F-PACE, legacy CarPlay receiver). Other cars will differ in
-  details: timers, required messages, display size. Reports are very welcome; see
-  [CONTRIBUTING.md](CONTRIBUTING.md).
-- Wired CarPlay only. Wireless CarPlay needs Bluetooth + Wi-Fi negotiation, which is not implemented.
-- The board needs its own stable power supply. On car USB power the NVMe drops out under load.
-- H.264 is encoded in software (libx264). The RK3588 hardware encoder is not usable from mainline yet.
-- Phone calls and the Android Auto head unit are experimental.
+[docs/protocol.md](docs/protocol.md) explains wired CarPlay from the phone side, step by step and
+byte by byte. [carplay/README.md](carplay/README.md) lists every setting.
+[docs/troubleshooting.md](docs/troubleshooting.md) maps symptoms to causes.
 
 ## Legal
 
-OrangeCar is an independent interoperability project, not affiliated with or endorsed by Apple, Google or
-Jaguar Land Rover. CarPlay, iPhone and AirPlay are trademarks of Apple Inc. Use it on your own car, at
-your own risk, and keep your eyes on the road: the dashboard is designed to be glanceable, but you are
-responsible for using it safely and legally.
+This is an independent interoperability project, not affiliated with or endorsed by Apple or any car
+maker. CarPlay, iPhone and AirPlay are trademarks of Apple Inc. Use it on your own car, at your own
+risk, and keep your eyes on the road.
 
-Licensed under the **GPL-3.0**. See [LICENSE](LICENSE) and [THIRD_PARTY.md](THIRD_PARTY.md) for the
-projects this work builds on.
+Licensed under the **GPL-3.0**. See [LICENSE](LICENSE) and [THIRD_PARTY.md](THIRD_PARTY.md).

@@ -1,0 +1,19 @@
+[Unit]
+Description=Minimal CarPlay iPhone (Pi Zero W)
+After=avahi-daemon.service
+Wants=avahi-daemon.service
+# Never give up: every replug must get a fresh attempt.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/rascar/carplay.env
+ExecStart=/usr/local/sbin/rascar-carplay-run
+Restart=always
+# A few seconds between attempts: re-presenting the iPhone too quickly makes
+# some head units stop offering CarPlay for a while.
+RestartSec=10
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

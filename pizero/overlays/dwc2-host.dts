@@ -1,0 +1,17 @@
+// Fallback for kernels WITHOUT CONFIG_USB_ROLE_SWITCH: a runtime overlay that
+// flips dwc2's dr_mode to "host". pizero/role-switch-rebind.sh applies it while
+// dwc2 is unbound, then re-binds the driver, which re-reads dr_mode on probe.
+// Slower than the role switch (~0.5 s for the re-probe) and less tested.
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&usb>;
+		__overlay__ {
+			dr_mode = "host";
+		};
+	};
+};

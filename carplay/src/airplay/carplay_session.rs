@@ -68,10 +68,7 @@ use crate::airplay::rtsp::{bplist, hap_frame_nonce, seal_control_frame, RtspClie
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use crate::host::AirPlayEndpoint;
-use crate::stream::audio::AudioCapture;
 use crate::stream::crypto::VideoCipher;
-use crate::stream::input::{map_coords, InputInjector, TouchAction};
-use crate::stream::render;
 use crate::stream::video::{is_first_slice, nal_type, NalParser, VideoEncoder, VideoSettings};
 
 /// Shared RTSP control client: the handshake owns it directly, then it is wrapped
@@ -299,34 +296,20 @@ const ENTITY_ACCESSORY: i64 = 2;
 
 /// Do we take the head unit's MainAudio resource?
 ///
-/// This is the SINGLE source of truth for the audio decision, because
-/// `modesChanged` and the audio `SETUP` must agree. They did not: we handed
-/// MainAudio to the ACCESSORY in `modesChanged` and then issued `SETUP` for a
-/// MainAudio stream (type 100) anyway — telling the receiver "you own the audio"
-/// and immediately demanding the audio stream. On the Jaguar that SETUP (cseq=8)
-/// is the one request it NEVER answers: it stops reading the video TCP 1.1 s
-/// later and pulls its USB gadget 2.3 s after that
-/// (boot-20260920-185642 run 005). Both settings are now derived here, so each
-/// configuration is internally consistent.
+/// `modesChanged` and the audio `SETUP` must agree: on the tested car, giving
+/// MainAudio to the accessory and then asking for a MainAudio stream anyway is
+/// the one request it never answers, and it drops the session ~2 s later.
+/// This build has no audio stream, so MainAudio stays the car's (the reference
+/// transmitter does the same when it has no phone audio behind it).
 ///
-/// DEFAULT: true. The reference implementation (catplay-labs/catplay, used as
-/// a reference for the wire format) starts a session with both MainScreen and
-/// MainAudio permanently owned by the Controller, i.e. the phone.
-///
-/// We defaulted to FALSE, i.e. we handed MainAudio to the ACCESSORY in the very
-/// message that tells the head unit who owns screen and audio. That is a
-/// deviation from the only implementation known to complete a session on a
-/// Harman QNX unit -- and the Jaguar F-PACE is Harman. Both in-car sessions that
-/// got furthest (120 and 75 frames, the two best ever) ran with this ON.
-///
-/// `RASCAR_CARPLAY_AUDIO=off` restores the old behaviour for an A/B;
-/// `RASCAR_MODES_CLAIM_AUDIO` still overrides the claim independently.
+/// Note: the original build's two longest in-car sessions ran WITH audio
+/// claimed and streamed. If a car drops the session around modesChanged, that
+/// is the first difference to look at.
 pub(crate) fn claims_main_audio() -> bool {
-    match std::env::var("RASCAR_CARPLAY_AUDIO") {
-        Ok(v) if v.eq_ignore_ascii_case("off") => false,
-        Ok(v) if v.eq_ignore_ascii_case("on") => true,
-        _ => crate::debug::env_flag("RASCAR_MODES_CLAIM_AUDIO", true),
-    }
+    // This minimal build never opens an audio stream, so it must never claim
+    // MainAudio: claiming it and then not opening the stream is the
+    // contradiction the tested head unit tears the session down over.
+    false
 }
 
 /// Whether to open the audio stream at all. Follows the resource claim so we can
@@ -377,13 +360,7 @@ fn modes_params(phone_call: bool, screen_to_car: bool, screen_borrowed: bool, au
     }
     // We claim MainScreen, and by default LEAVE MainAudio TO THE CAR.
     //
-    // We used to claim both unconditionally while never opening an audio stream —
-    // i.e. the phone seizes the head unit's main audio path and then emits
-    // nothing, which is exactly the "session incomplete" state a start-up
-    // watchdog fires on. The reference transmitter, in this same scenario (its own
-    // UI overlay, no phone peer behind it), explicitly sets MainAudio to the
-    // accessory and takes only the screen. `RASCAR_MODES_CLAIM_AUDIO=on` restores
-    // the old behaviour for an A/B at the car.
+    // MainAudio is the phone's only when we stream audio (never in this build).
     let audio_entity = if claims_main_audio() { ENTITY_CONTROLLER } else { ENTITY_ACCESSORY };
     let mut params = plist::Dictionary::new();
     params.insert(
@@ -870,18 +847,16 @@ fn handle_key_edges(device: &str, uuid: &str, report: &[u8], edges: &[hid::KeyEd
         match edge {
             hid::KeyEdge::Down(u) => match hid::CarKey::from_usage(*u) {
                 Some(k) => {
-                    let sent = crate::stream::carkeys::send(k);
                     info!(
-                        "car key: {device} uuid={uuid} report={} → press {} → dashboard '{}'{} (car borrows audio={})",
+                        "car key: {device} uuid={uuid} report={} → press {} ('{}')",
                         hex::encode(report),
                         hid::usage_name(*u),
                         k.wire_name(),
-                        if sent { "" } else { " — send to rascar-app FAILED" },
-                        accessory_borrows(RESOURCE_MAIN_AUDIO),
                     );
+                    crate::stream::events::send(&format!("key {}", k.wire_name()));
                 }
                 None => info!(
-                    "car key: {device} uuid={uuid} report={} → press {} (no dashboard action)",
+                    "car key: {device} uuid={uuid} report={} → press {} (no action)",
                     hex::encode(report),
                     hid::usage_name(*u),
                 ),
@@ -1062,36 +1037,29 @@ async fn run_event_responder(
 /// size instead clamped every touch to the bottom-right dashboard pixel.
 const HID_TOUCH_LOGICAL: (u32, u32) = (32768, 32768);
 
-/// Consume parsed touch events, derive Press/Drag/Release from the touch-down
-/// transition, map car coords → dashboard coords, and inject via [`InputInjector`].
+/// Consume parsed touch events, map the car's HID logical range onto the
+/// encoded picture, log them and forward them as `touch down|move|up X Y` lines
+/// (see `stream::events`) for whatever draws the picture.
 fn spawn_touch_injector(
     mut touch_rx: mpsc::UnboundedReceiver<HidTouch>,
     car_res: (u32, u32),
     dash_res: (u32, u32),
-    display: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut injector = InputInjector::new(&display, dash_res.0, dash_res.1);
-        if let Err(e) = injector.setup() {
-            warn!("touch: injector setup failed ({e:#}) — touch disabled for this session");
-            // Still drain the channel so the sender never backpressures.
-            while touch_rx.recv().await.is_some() {}
-            return;
-        }
         let mut was_down = false;
         while let Some(t) = touch_rx.recv().await {
             let action = match (was_down, t.down) {
-                (false, true) => TouchAction::Press,
-                (true, true) => TouchAction::Drag,
-                (true, false) => TouchAction::Release,
+                (false, true) => "down",
+                (true, true) => "move",
+                (true, false) => "up",
                 (false, false) => continue, // spurious up-while-up
             };
             was_down = t.down;
-            let (mx, my) = map_coords(t.x as u32, t.y as u32, car_res, dash_res);
-            debug!("touch {action:?} car=({},{}) → dash=({mx},{my})", t.x, t.y);
-            injector.inject_touch(action, mx, my, 0);
+            let scale = |v: u16, from: u32, to: u32| ((v as u64 * to as u64) / from.max(1) as u64).min(to.saturating_sub(1) as u64);
+            let (x, y) = (scale(t.x, car_res.0, dash_res.0), scale(t.y, car_res.1, dash_res.1));
+            debug!("touch {action} car=({},{}) → ({x},{y})", t.x, t.y);
+            crate::stream::events::send(&format!("touch {action} {x} {y}"));
         }
-        info!("touch: event source closed — stopping injector");
     })
 }
 
@@ -1335,621 +1303,13 @@ fn log_hid_devices(devices: &[hid::HidDevice]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Audio (type 100 PCM 48k stereo over RTP/UDP) — et=NONE, no crypto
-// ---------------------------------------------------------------------------
-//
-// Field names + enum values as in the catplay-labs/catplay stream description
-// (used as a reference for the wire format):
-//   type=MainAudio(100), audioFormat=PCM_48000_STEREO (bit 15), audioType=Media.
-// NOTE (INFERRED vs task text): catplay's `AudioType` is a plain `plist_enum!`,
-// so it serializes as the STRING "media", not an integer — the task's
-// "audioType:Media(int)" is imprecise; the byte-accurate value is the string.
-// StreamType and AudioFormat ARE integers (plist_enum_repr / bitflags).
-
-const AUDIO_STREAM_TYPE_MAIN: i64 = 100;
-const AUDIO_FMT_PCM_48000_STEREO: i64 = 1 << 15;
-const AUDIO_LATENCY_MS: i64 = 100;
-const AUDIO_SAMPLE_RATE: u32 = 48000;
-const AUDIO_CHANNELS: u32 = 2;
-/// Frames per RTP packet (catplay: 352, also for PCM telephony).
-const AUDIO_FRAMES_PER_PACKET: u32 = 352;
-const AUDIO_PAYLOAD_TYPE: u8 = 100;
-/// Redundancy is a modern-CarPlay feature we do not implement.
-const AUDIO_SUPPORTS_RTP_REDUNDANCY: bool = false;
-/// catplay always advertises high-accuracy timestamps on the audio stream.
-const AUDIO_SUPPORTS_HIGH_ACCURACY_TS: bool = true;
-
-/// Telephony PCM formats we can use, best first, as (audioFormat bit, rate).
-/// All mono 16-bit (catplay's receiver offers 16/24/32 kHz for telephony; its
-/// own transmitter test uses 16 kHz).
-const TELEPHONY_FORMATS: &[(i64, u32)] = &[(1 << 6, 24000), (1 << 4, 16000), (1 << 8, 32000), (1 << 14, 48000)];
-/// When `/info` gives no usable list: catplay's transmitter default.
-const TELEPHONY_FALLBACK: (i64, u32) = (1 << 4, 16000);
-
-/// What the MainAudio stream carries.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum AudioMode {
-    /// Music etc.: 48 kHz stereo, output only.
-    Media,
-    /// A meeting: `format` (mono PCM at `rate`) both ways, the car's
-    /// microphone coming back to us.
-    Telephony { format: i64, rate: u32 },
-    /// An incoming modem call rings: our generated ringtone, output only, in
-    /// the format the car lists for `audioType: "alert"` (spec Table 23-46:
-    /// "Ringtones, alarms, and other high-priority sounds").
-    Alert { format: i64, rate: u32, channels: u32 },
-}
-
-impl AudioMode {
-    fn rate(self) -> u32 {
-        match self {
-            AudioMode::Media => AUDIO_SAMPLE_RATE,
-            AudioMode::Telephony { rate, .. } | AudioMode::Alert { rate, .. } => rate,
-        }
-    }
-    fn channels(self) -> u32 {
-        match self {
-            AudioMode::Media => AUDIO_CHANNELS,
-            AudioMode::Telephony { .. } => 1,
-            AudioMode::Alert { channels, .. } => channels,
-        }
-    }
-    fn is_call(self) -> bool {
-        matches!(self, AudioMode::Telephony { .. })
-    }
-}
-
-/// The telephony mode the car supports, from `/info.audioFormats`
-/// (`[{type, audioType, audioInputFormats, audioOutputFormats}]`, catplay
-/// `AudioFormatStruct`). `None` = the car lists formats but none for
-/// telephony: it has no hands-free path for us, so meetings keep the
-/// dashboard's own audio. Also logs the list: the full `/info` dump is cut
-/// by the car's embedded PNG icons before it ever reaches it.
-fn telephony_mode_from_info(body: &[u8]) -> Option<AudioMode> {
-    let fallback = AudioMode::Telephony { format: TELEPHONY_FALLBACK.0, rate: TELEPHONY_FALLBACK.1 };
-    let Ok(v) = bplist::from_bytes(body) else { return Some(fallback) };
-    let Some(list) = v.as_dictionary().and_then(|d| d.get("audioFormats")).and_then(|x| x.as_array()) else {
-        info!("← /info audioFormats: absent — telephony will try {}Hz mono", TELEPHONY_FALLBACK.1);
-        return Some(fallback);
-    };
-    let int = |d: &plist::Dictionary, k: &str| d.get(k).and_then(plist_int);
-    let mut telephony = None;
-    for e in list.iter().filter_map(|e| e.as_dictionary()) {
-        let ty = int(e, "type");
-        let at = e.get("audioType").and_then(|x| x.as_string()).unwrap_or("-");
-        let (inp, out) = (int(e, "audioInputFormats"), int(e, "audioOutputFormats"));
-        info!("← /info audioFormats: type={ty:?} audioType={at} in={inp:?} out={out:?}");
-        if ty == Some(AUDIO_STREAM_TYPE_MAIN) && at == "telephony" {
-            telephony = Some(inp.unwrap_or(0) & out.unwrap_or(0));
-        }
-    }
-    let mask = telephony?;
-    let (format, rate) = TELEPHONY_FORMATS.iter().copied().find(|(bit, _)| mask & bit != 0).unwrap_or(TELEPHONY_FALLBACK);
-    Some(AudioMode::Telephony { format, rate })
-}
-
-/// Alert PCM formats we can generate, best first, as (audioFormat bit, rate,
-/// channels): `AirPlayCommon.h:346-351`. The spec requires the car to take
-/// 44.1 or 48 kHz 16-bit for alerts (23.2.8.2.5, Table 23-16); the Jaguar
-/// lists exactly `0x800` = PCM_44KHz_16Bit_Stereo (2026-09-29 pcap).
-const ALERT_FORMATS: &[(i64, u32, u32)] = &[(1 << 11, 44100, 2), (1 << 15, 48000, 2), (1 << 10, 44100, 1), (1 << 14, 48000, 1)];
-
-/// The alert (ringtone) mode the car offers in `/info.audioFormats`.
-///
-/// Unlike telephony there is NO fallback: this car tears CarPlay down on
-/// traffic it did not declare, and ringing has a harmless alternative (the
-/// dashboard shows the call, the media stream keeps playing). So we only ever
-/// SETUP an alert stream the car listed, in a format it listed.
-fn alert_mode_from_info(body: &[u8]) -> Option<AudioMode> {
-    let v = bplist::from_bytes(body).ok()?;
-    let list = v.as_dictionary()?.get("audioFormats")?.as_array()?;
-    let mask = list.iter().filter_map(|e| e.as_dictionary()).find_map(|e| {
-        let ty = e.get("type").and_then(plist_int);
-        let at = e.get("audioType").and_then(|x| x.as_string());
-        (ty == Some(AUDIO_STREAM_TYPE_MAIN) && at == Some("alert")).then(|| e.get("audioOutputFormats").and_then(plist_int).unwrap_or(0))
-    })?;
-    let (format, rate, channels) = ALERT_FORMATS.iter().copied().find(|(bit, _, _)| mask & bit != 0)?;
-    Some(AudioMode::Alert { format, rate, channels })
-}
-
-/// What the MainAudio stream should carry for a line state.
-///
-/// A call (meeting or modem) beats ringing: the user is talking, and a second
-/// call ringing then is shown on the dashboard only (the backend has no call
-/// waiting). Each mode needs the car to offer its stream type (`None` = the
-/// car did not list it); otherwise the line state falls through to the next.
-fn desired_audio_mode(line: crate::stream::call::Line, telephony: Option<AudioMode>, alert: Option<AudioMode>) -> AudioMode {
-    match (line.call, telephony, line.ring, alert) {
-        (true, Some(t), _, _) => t,
-        (_, _, true, Some(a)) => a,
-        _ => AudioMode::Media,
-    }
-}
-
-/// Whether `modesChanged` announces `phoneCall: Controller` for `mode`.
-///
-/// Telephony: yes, that is what lets us SETUP a telephony stream (catplay
-/// `ModesState.phone_call`). Alert (ringing): the spec defines phoneCall as
-/// "an entity is on a phone call" (23.3.3.2) and says nothing about ringing,
-/// so by default we leave it at None and only re-state our MainAudio
-/// ownership before the alert SETUP. `RASCAR_PHONE_RING_CALLSTATE=on` asserts
-/// phoneCall while ringing instead, an A/B for whether that makes the Jaguar
-/// bring the CarPlay screen forward (hypothesis, never tested at the car).
-fn announces_phone_call(mode: AudioMode) -> bool {
-    match mode {
-        AudioMode::Telephony { .. } => true,
-        AudioMode::Alert { .. } => crate::debug::env_flag("RASCAR_PHONE_RING_CALLSTATE", false),
-        AudioMode::Media => false,
-    }
-}
-
-/// Build the audio stream `SETUP /` body (single type-100 PCM stream).
-///
-/// The key set + values are those the catplay-labs/catplay transmitter puts on
-/// the wire for an audio stream (camelCase keys, absent optional keys omitted):
-///   streamConnectionID, type, audioFormat, audioLatencyMs, audioType, input,
-///   supportsRTPPacketRedundancy, supportsHighAccuracyTimestamps.
-/// There is NO `uuid` on an audio stream (that field is screen-only,
-/// `StreamDescriptionScreen`), and NO per-stream encryption key: stream
-/// encryption is negotiated once at the session level in the initial
-/// `SETUP /setup` (`et`), never in the per-stream SETUP.
-///
-/// `scid` is the streamConnectionID: `0` for an unencrypted (et=NONE) session —
-/// exactly what catplay's `do_setup_audio` emits when `cipher != ChaCha` — and a
-/// random strictly-positive value on a HAP-paired session (it keys the audio
-/// RTP ChaCha stream, `DataStream-Salt<scid>`, just like the screen).
-///
-/// Telephony adds `input: true` and our own `dataPort`: the car records its
-/// microphone and sends it there (catplay `RtpReceiver::new_common` connects
-/// its recorder to `peer:data_port`, and rejects an input stream without one).
-fn build_audio_setup(scid: i64, control_port: u16, mode: AudioMode, input_port: Option<u16>) -> Result<Vec<u8>> {
-    let mut s = plist::Dictionary::new();
-    s.insert("streamConnectionID".into(), scid.into());
-    s.insert("type".into(), AUDIO_STREAM_TYPE_MAIN.into());
-    match mode {
-        AudioMode::Media => {
-            s.insert("audioType".into(), "media".into());
-            s.insert("audioFormat".into(), AUDIO_FMT_PCM_48000_STEREO.into());
-            s.insert("input".into(), false.into());
-        }
-        AudioMode::Alert { format, .. } => {
-            s.insert("audioType".into(), "alert".into());
-            s.insert("audioFormat".into(), format.into());
-            s.insert("input".into(), false.into());
-        }
-        AudioMode::Telephony { format, .. } => {
-            s.insert("audioType".into(), "telephony".into());
-            s.insert("audioFormat".into(), format.into());
-            s.insert("input".into(), true.into());
-            if let Some(p) = input_port {
-                s.insert("dataPort".into(), (p as i64).into());
-            }
-        }
-    }
-    s.insert("audioLatencyMs".into(), AUDIO_LATENCY_MS.into());
-    s.insert("supportsRTPPacketRedundancy".into(), AUDIO_SUPPORTS_RTP_REDUNDANCY.into());
-    s.insert("supportsHighAccuracyTimestamps".into(), AUDIO_SUPPORTS_HIGH_ACCURACY_TS.into());
-    // Advertise our RTCP control port (catplay's TX always binds an RTCP socket
-    // and carries `controlPort` in the audio SETUP request; a receiver that
-    // wants RTCP clock/liveness on the audio stream sees an RTP-only stream as
-    // incomplete). Our screen stream logged controlPort=None because we never
-    // offered one — now we do, and hold the socket open for the session.
-    s.insert("controlPort".into(), (control_port as i64).into());
-    let mut d = plist::Dictionary::new();
-    d.insert("streams".into(), bplist::Value::Array(vec![bplist::Value::Dictionary(s)]));
-    bplist::to_bytes(&bplist::Value::Dictionary(d))
-}
-
-/// Extract `(dataPort, controlPort)` for a stream `type` from a SETUP reply.
-fn extract_audio_ports(v: &bplist::Value, stream_type: i64) -> (Option<u16>, Option<u16>) {
-    let Some(streams) = v.as_dictionary().and_then(|d| d.get("streams")).and_then(|x| x.as_array()) else {
-        return (None, None);
-    };
-    for s in streams {
-        let Some(d) = s.as_dictionary() else { continue };
-        let ty = d
-            .get("type")
-            .and_then(|x| x.as_signed_integer().or_else(|| x.as_unsigned_integer().map(|n| n as i64)));
-        if ty == Some(stream_type) {
-            return (plist_u16(d, "dataPort"), plist_u16(d, "controlPort"));
-        }
-    }
-    (None, None)
-}
-
-/// Audio RTP payload cipher, selected to MATCH the negotiated session encryption
-/// (exactly like the screen). The catplay receiver keys audio decryption off the
-/// SESSION cipher (`self.stream_encryption`, set in the initial `SETUP /setup`),
-/// NOT off any per-stream field — so a HAP-paired session (which our Jaguar
-/// forces by 466-ing et=NONE) expects ChaCha-encrypted audio, and only a true
-/// et=NONE session accepts plaintext PCM.
-///
-/// The ChaCha derivation is identical to the screen DataStream cipher
-/// (`crate::stream::crypto::derive_chacha_key`, HKDF-SHA512, salt
-/// `DataStream-Salt<scid>`, info `DataStream-Output-Encryption-Key`); only the
-/// per-packet framing differs (catplay `rtp/rtp_cipher_chacha.rs`):
-/// `[RTP hdr 12][ciphertext N][Poly1305 tag 16][nonce 8]`, AAD =
-/// `((timestamp<<32)|ssrc)` big-endian (8 bytes), nonce = `[0;4] ++ LE64(counter)`.
-enum AudioRtpCipher {
-    /// Plaintext PCM — only for a genuine et=NONE session.
-    None,
-    /// ChaCha20-Poly1305, keyed with the audio stream's streamConnectionID.
-    ChaCha { aead: Box<ChaCha20Poly1305>, counter: u64 },
-}
-
-impl AudioRtpCipher {
-    /// Build the audio cipher from the session's pairing secret. `None`/empty
-    /// secret → plaintext (et=NONE). A paired secret → ChaCha keyed with `scid`.
-    fn from_session(paired_secret: Option<&[u8]>, scid: i64) -> Self {
-        if let Some(secret) = paired_secret.filter(|s| !s.is_empty()) {
-            match crate::stream::crypto::derive_chacha_key(secret, scid) {
-                Ok(key) => match ChaCha20Poly1305::new_from_slice(&key) {
-                    Ok(aead) => {
-                        return AudioRtpCipher::ChaCha { aead: Box::new(aead), counter: 0 };
-                    }
-                    Err(e) => warn!("audio: chacha init failed ({e}) — sending plaintext"),
-                },
-                Err(e) => warn!("audio: chacha HKDF failed ({e:#}) — sending plaintext"),
-            }
-        }
-        AudioRtpCipher::None
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            AudioRtpCipher::None => "none(plaintext)",
-            AudioRtpCipher::ChaCha { .. } => "chacha20-poly1305",
-        }
-    }
-
-    /// Assemble a full RTP packet (12-byte header, PT=100) for `pcm`, encrypting
-    /// the payload per the session cipher.
-    fn build_packet(&mut self, seq: u16, ts: u32, ssrc: u32, pcm: &[u8]) -> Vec<u8> {
-        let mut pkt = Vec::with_capacity(12 + pcm.len() + 24);
-        pkt.push(2u8 << 6); // v=2, p=0, x=0, cc=0
-        pkt.push(AUDIO_PAYLOAD_TYPE); // marker=0, PT=100
-        pkt.extend_from_slice(&seq.to_be_bytes());
-        pkt.extend_from_slice(&ts.to_be_bytes());
-        pkt.extend_from_slice(&ssrc.to_be_bytes());
-        match self {
-            AudioRtpCipher::None => pkt.extend_from_slice(pcm),
-            AudioRtpCipher::ChaCha { aead, counter } => {
-                let aad = (((ts as u64) << 32) | ssrc as u64).to_be_bytes();
-                let mut n = [0u8; 12];
-                n[4..].copy_from_slice(&counter.to_le_bytes());
-                let ct = aead
-                    .encrypt(Nonce::from_slice(&n), Payload { msg: pcm, aad: &aad })
-                    .expect("audio chacha seal");
-                pkt.extend_from_slice(&ct); // ciphertext + 16-byte Poly1305 tag
-                pkt.extend_from_slice(&counter.to_le_bytes()); // 8-byte nonce trailer
-                *counter = counter.wrapping_add(1);
-            }
-        }
-        pkt
-    }
-}
-
-/// Decrypts what the car sends on a telephony stream (its microphone): the
-/// same RTP/ChaCha framing as [`AudioRtpCipher`], keyed with the "Input"
-/// direction (catplay: the receiver's write cipher is the Input key).
-enum MicCipher {
-    None,
-    ChaCha(Box<ChaCha20Poly1305>),
-}
-
-impl MicCipher {
-    fn from_session(paired_secret: Option<&[u8]>, scid: i64) -> Self {
-        if let Some(secret) = paired_secret.filter(|s| !s.is_empty()) {
-            match crate::stream::crypto::derive_chacha_input_key(secret, scid)
-                .map_err(|e| anyhow!("{e:#}"))
-                .and_then(|k| ChaCha20Poly1305::new_from_slice(&k).map_err(|e| anyhow!("{e}")))
-            {
-                Ok(aead) => return MicCipher::ChaCha(Box::new(aead)),
-                Err(e) => warn!("call: mic chacha init failed ({e:#}) — treating it as plaintext"),
-            }
-        }
-        MicCipher::None
-    }
-
-    /// One received RTP packet → its PCM payload (None when it does not verify).
-    fn open<'a>(&self, pkt: &'a [u8]) -> Option<std::borrow::Cow<'a, [u8]>> {
-        if pkt.len() < 12 || pkt[0] >> 6 != 2 {
-            return None;
-        }
-        match self {
-            MicCipher::None => Some(std::borrow::Cow::Borrowed(&pkt[12..])),
-            MicCipher::ChaCha(aead) => {
-                if pkt.len() < 12 + 16 + 8 {
-                    return None;
-                }
-                let ts = u32::from_be_bytes(pkt[4..8].try_into().ok()?);
-                let ssrc = u32::from_be_bytes(pkt[8..12].try_into().ok()?);
-                let aad = (((ts as u64) << 32) | ssrc as u64).to_be_bytes();
-                let mut n = [0u8; 12];
-                n[4..].copy_from_slice(&pkt[pkt.len() - 8..]);
-                aead.decrypt(Nonce::from_slice(&n), Payload { msg: &pkt[12..pkt.len() - 8], aad: &aad })
-                    .ok()
-                    .map(std::borrow::Cow::Owned)
-            }
-        }
-    }
-}
-
-/// If enabled (default; `RASCAR_CARPLAY_AUDIO=off` disables), run the audio path
-/// entirely on a spawned task so it can NEVER stall the picture: the SETUP is
-/// issued on the SHARED control channel (after the screen data channel and
-/// encoder are already up), and the RTP sender streams for the whole session.
-/// Best-effort — any failure just leaves the session without audio; the screen
-/// keeps running regardless. Returns the task handle for teardown.
-///
-/// While a meeting or modem call runs (rascar-app says so, see `stream::call`),
-/// the stream is swapped for a telephony one carrying the car's microphone;
-/// while an incoming modem call rings, for an "alert" one carrying our
-/// ringtone; and swapped back afterwards. `telephony` / `alert` are what
-/// `/info` says the car accepts (None = the car has no such stream: that line
-/// state keeps the media stream).
-fn maybe_start_audio(
-    rtsp: SharedRtsp,
-    peer: SocketAddr,
-    paired_secret: Option<Vec<u8>>,
-    telephony: Option<AudioMode>,
-    alert: Option<AudioMode>,
-) -> Option<tokio::task::JoinHandle<()>> {
-    if !audio_enabled() {
-        info!(
-            "audio: NOT opening a MainAudio stream — modesChanged gives MainAudio to the \
-             accessory, so asking for the stream would contradict what we just told the car \
-             (RASCAR_CARPLAY_AUDIO=on to take the resource and stream it)"
-        );
-        return None;
-    }
-    let telephony = telephony.filter(|_| crate::stream::call::enabled());
-    let alert = alert.filter(|_| crate::stream::call::ring_enabled());
-    Some(tokio::spawn(async move {
-        let mut line = crate::stream::call::subscribe();
-        // A line already up when the session starts (the car reconnected
-        // mid-call or mid-ring) is evaluated once the media stream runs,
-        // instead of waiting for its next state change.
-        line.mark_changed();
-        let mut mode = AudioMode::Media;
-        // A call/alert stream the car refused: not asked again while the line
-        // still wants it (a refusal per heartbeat would hammer the car).
-        let mut refused: Option<AudioMode> = None;
-        loop {
-            wait_while_car_borrows_audio().await;
-            let running = open_audio_stream(&rtsp, peer, paired_secret.as_deref(), mode).await;
-            let Some(running) = running else {
-                if mode != AudioMode::Media {
-                    // The car refused the telephony/alert stream: give it its
-                    // media stream back rather than leave it silent, and say
-                    // so first (ownership before SETUP).
-                    warn!("audio: {mode:?} stream refused — back to media audio until the line changes");
-                    let _ = send_modes_changed(&rtsp, false).await;
-                    refused = Some(mode);
-                    mode = AudioMode::Media;
-                    continue;
-                }
-                return;
-            };
-            // Stream until the line wants another mode (or the stream dies).
-            let next = tokio::select! {
-                _ = running.run() => return,
-                next = async {
-                    loop {
-                        if line.changed().await.is_err() {
-                            std::future::pending::<()>().await;
-                        }
-                        let desired = desired_audio_mode(*line.borrow(), telephony, alert);
-                        if refused.is_some_and(|r| r != desired) {
-                            refused = None;
-                        }
-                        let next = if refused == Some(desired) { AudioMode::Media } else { desired };
-                        if next != mode {
-                            return next;
-                        }
-                    }
-                } => next,
-            };
-            info!("audio: switching {mode:?} → {next:?}");
-            send_audio_teardown(&rtsp).await;
-            // iPhone order: announce the call, then its stream; end the stream,
-            // then the call. Every switch re-states ownership before the SETUP,
-            // including ring → call and alert → media.
-            let _ = send_modes_changed(&rtsp, announces_phone_call(next)).await;
-            mode = next;
-        }
-    }))
-}
-
-/// Aborts a helper task when the stream that owns it goes away.
+/// Aborts the wrapped task when dropped.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
-}
-
-/// One negotiated MainAudio stream, ready to run.
-struct RunningAudio {
-    sock: tokio::net::UdpSocket,
-    dst: SocketAddr,
-    cipher: AudioRtpCipher,
-    mode: AudioMode,
-    /// Telephony: the socket the car sends its microphone to.
-    mic: Option<(tokio::net::UdpSocket, MicCipher)>,
-    _rtcp: AbortOnDrop,
-}
-
-impl RunningAudio {
-    /// Send (and, for a call, receive) until the stream dies. Dropping this
-    /// future (a meeting starts/ends) stops parec and removes the car mic.
-    async fn run(self) {
-        let RunningAudio { sock, dst, cipher, mode, mic, _rtcp } = self;
-        if let AudioMode::Alert { rate, channels, .. } = mode {
-            return run_ringtone_rtp(sock, dst, cipher, rate, channels).await;
-        }
-        match mic {
-            None => run_audio_rtp(sock, dst, cipher, mode.rate(), mode.channels()).await,
-            Some((mic_sock, mic_cipher)) => {
-                tokio::select! {
-                    _ = run_audio_rtp(sock, dst, cipher, mode.rate(), mode.channels()) => {}
-                    _ = run_car_mic(mic_sock, mic_cipher, mode.rate()) => {}
-                }
-            }
-        }
-    }
-}
-
-/// SETUP one MainAudio stream in `mode`. None = no audio (logged).
-async fn open_audio_stream(rtsp: &SharedRtsp, peer: SocketAddr, paired_secret: Option<&[u8]>, mode: AudioMode) -> Option<RunningAudio> {
-    let paired = paired_secret.map(|s| !s.is_empty()).unwrap_or(false);
-    // scid = 0 for an unencrypted session (catplay emits 0 when cipher!=ChaCha),
-    // random strictly-positive for a paired session (keys the audio ChaCha).
-    let scid: i64 = if paired { random_positive_i64() } else { 0 };
-    info!("→ SETUP audio ({mode:?}, type=100, streamConnectionID={scid}, {})", if paired { "chacha" } else { "unencrypted" });
-    // Bind our RTCP control socket BEFORE the SETUP so we can advertise its
-    // port in the request (catplay pattern); held open for the session below.
-    let ubind = if peer.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-    let bind = |what: &'static str| async move {
-        match tokio::net::UdpSocket::bind(ubind).await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                warn!("audio: {what} bind failed: {e:#} — audio disabled");
-                None
-            }
-        }
-    };
-    let rtcp_sock = bind("RTCP").await?;
-    let our_control_port = rtcp_sock.local_addr().ok()?.port();
-    let mic_sock = if mode.is_call() { Some(bind("microphone").await?) } else { None };
-    let mic_port = match &mic_sock {
-        Some(s) => Some(s.local_addr().ok()?.port()),
-        None => None,
-    };
-    let body = match build_audio_setup(scid, our_control_port, mode, mic_port) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("audio: marshal SETUP failed: {e:#} — audio disabled");
-            return None;
-        }
-    };
-    // Audio is OPTIONAL and must never cost us the picture. The RTSP
-    // connection is shared behind a mutex, so this request holds the control
-    // channel for as long as it waits — and the car may simply not answer it
-    // (measured 2026-09-20 one capture run: audio SETUP went out as cseq=8,
-    // was never answered, and `/feedback` then never ticked once before the
-    // head unit detached 3.2 s later). The generic RTSP timeout is 10 s,
-    // which is longer than an entire session, so bound this one far tighter.
-    //
-    // The car may also answer LATE: 3.2 s on 2026-10-01 (drive 2), after which
-    // the whole session ran without audio. So on timeout we release the channel
-    // and keep waiting for the reply off the lock: the RTSP client sets a late
-    // reply aside by CSeq while `/feedback` reads its own.
-    const AUDIO_SETUP_TIMEOUT: Duration = Duration::from_millis(1500);
-    const AUDIO_SETUP_LATE_WAIT: Duration = Duration::from_secs(10);
-    let (resp, cseq) = {
-        let mut guard = rtsp.lock().await;
-        let r = tokio::time::timeout(AUDIO_SETUP_TIMEOUT, guard.request("SETUP", "/", PLIST_CT, &body, &Vec::new())).await;
-        (r, guard.last_cseq())
-    };
-    let resp = match resp {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            warn!("audio: SETUP request failed: {e:#} — audio disabled");
-            return None;
-        }
-        Err(_) => {
-            warn!(
-                "audio: SETUP unanswered within {AUDIO_SETUP_TIMEOUT:?} — releasing the control channel, \
-                 waiting up to {AUDIO_SETUP_LATE_WAIT:?} more for a late reply (cseq={cseq})"
-            );
-            let deadline = tokio::time::Instant::now() + AUDIO_SETUP_LATE_WAIT;
-            loop {
-                if let Some(r) = rtsp.lock().await.take_late_reply(cseq) {
-                    info!("audio: late SETUP reply received (cseq={cseq})");
-                    break r;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    warn!("audio: SETUP still unanswered after {AUDIO_SETUP_LATE_WAIT:?} more — audio disabled");
-                    return None;
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }
-    };
-    if !resp.is_success() {
-        warn!("audio: SETUP REJECTED HTTP {} — continuing without audio", resp.status);
-        return None;
-    }
-    let reply = match bplist::from_bytes(&resp.body) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("audio: SETUP reply not a plist: {e:#} — audio disabled");
-            return None;
-        }
-    };
-    let (data_port, control_port) = extract_audio_ports(&reply, AUDIO_STREAM_TYPE_MAIN);
-    let Some(data_port) = data_port else {
-        warn!("audio: SETUP reply carried no type-100 dataPort — audio disabled");
-        return None;
-    };
-    info!("← audio SETUP dataPort={data_port} controlPort={control_port:?}");
-
-    let sock = bind("RTP").await?;
-    let dst = with_port(peer, data_port);
-    // Hold the RTCP socket open for the whole stream: connect the reverse to
-    // the car's controlPort if it gave one, and drain anything it sends so the
-    // socket stays live. RTP+RTCP together = a complete audio stream (catplay).
-    if let Some(cp) = control_port {
-        let _ = rtcp_sock.connect(with_port(peer, cp)).await;
-    }
-    let rtcp = tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
-        while rtcp_sock.recv(&mut buf).await.is_ok() {}
-    });
-    let cipher = AudioRtpCipher::from_session(paired_secret, scid);
-    let mic = mic_sock.map(|s| (s, MicCipher::from_session(paired_secret, scid)));
-    Some(RunningAudio { sock, dst, cipher, mode, mic, _rtcp: AbortOnDrop(rtcp) })
-}
-
-/// `TEARDOWN /` of the MainAudio stream only (catplay `TeardownStream{type}`).
-async fn send_audio_teardown(rtsp: &SharedRtsp) {
-    let mut stream = plist::Dictionary::new();
-    stream.insert("type".into(), AUDIO_STREAM_TYPE_MAIN.into());
-    let mut d = plist::Dictionary::new();
-    d.insert("streams".into(), bplist::Value::Array(vec![bplist::Value::Dictionary(stream)]));
-    let Ok(body) = bplist::to_bytes(&bplist::Value::Dictionary(d)) else { return };
-    let mut guard = rtsp.lock().await;
-    match tokio::time::timeout(Duration::from_millis(1500), guard.request("TEARDOWN", "/", PLIST_CT, &body, &Vec::new())).await {
-        Ok(Ok(r)) => info!("← TEARDOWN audio HTTP {}", r.status),
-        Ok(Err(e)) => warn!("audio: TEARDOWN failed: {e:#}"),
-        Err(_) => warn!("audio: TEARDOWN unanswered"),
-    }
-}
-
-/// Hold an audio `SETUP` while the car borrows MainAudio. Since every accepted
-/// `changeModes` is followed by our `modesChanged` reporting the borrow (car =
-/// current entity), a `SETUP` during the borrow would ask for a stream the car
-/// was just told it holds — the contradiction the Jaguar never answers. Seen on
-/// the bench 2026-09-30: a slow (software-rendered) start put our SETUP after
-/// the car's borrow. Bounded, so a borrow that is never released cannot leave
-/// the session silent forever.
-async fn wait_while_car_borrows_audio() {
-    if !accessory_borrows(RESOURCE_MAIN_AUDIO) {
-        return;
-    }
-    info!("audio: the car borrows MainAudio — holding the audio SETUP until it gives it back");
-    let start = std::time::Instant::now();
-    while accessory_borrows(RESOURCE_MAIN_AUDIO) {
-        if start.elapsed() > Duration::from_secs(60) {
-            warn!("audio: MainAudio still borrowed after 60 s — opening the audio stream anyway");
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    info!("audio: MainAudio given back after {:.1} s — opening the audio stream", start.elapsed().as_secs_f64());
 }
 
 /// `POST /command modesChanged` with the phoneCall app state set to us (a
@@ -2038,241 +1398,6 @@ async fn send_screen_modes_changed(rtsp: &SharedRtsp, to_car: bool) -> Result<()
         SCREEN_TO_CAR.store(false, Ordering::Relaxed);
     }
     Ok(())
-}
-
-/// The car's microphone → the "Car microphone" PulseAudio source, for as long
-/// as the telephony stream lives.
-async fn run_car_mic(sock: tokio::net::UdpSocket, cipher: MicCipher, rate: u32) {
-    let mut mic = match crate::stream::call::CarMic::open(rate).await {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("call: cannot create the car microphone source: {e:#} — the car still gets the meeting audio");
-            // Keep the stream alive (the car may need it read) without a sink.
-            let mut buf = [0u8; 2048];
-            while sock.recv(&mut buf).await.is_ok() {}
-            return;
-        }
-    };
-    let (mut got, mut bad) = (0u64, 0u64);
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = match tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
-                warn!("call: mic recv: {e:#}");
-                break;
-            }
-            Err(_) => {
-                if got == 0 {
-                    warn!("call: no microphone packet from the car yet (5 s)");
-                }
-                continue;
-            }
-        };
-        match cipher.open(&buf[..n]) {
-            Some(pcm) => {
-                got += 1;
-                if got == 1 {
-                    info!("call: first microphone packet from the car ({} bytes PCM)", pcm.len());
-                }
-                if let Err(e) = mic.write(&pcm).await {
-                    warn!("call: mic write: {e:#}");
-                    break;
-                }
-            }
-            None => {
-                bad += 1;
-                if bad == 1 || bad % 500 == 0 {
-                    warn!("call: {bad} microphone packet(s) failed to decrypt/parse");
-                }
-            }
-        }
-    }
-    // `mic` drops here: that removes the source and restores the default.
-    drop(mic);
-}
-
-/// How often the send loop logs the level of the PCM it sends.
-const AUDIO_LEVEL_EVERY: Duration = Duration::from_secs(10);
-
-/// RMS / peak of 16-bit big-endian PCM (CarPlay's byte order) since the last report.
-struct PcmLevel {
-    since: Instant,
-    sum_sq: f64,
-    count: u64,
-    peak: i32,
-}
-
-impl PcmLevel {
-    fn new() -> Self {
-        Self { since: Instant::now(), sum_sq: 0.0, count: 0, peak: 0 }
-    }
-
-    fn add(&mut self, pcm_be: &[u8]) {
-        for b in pcm_be.chunks_exact(2) {
-            let v = i16::from_be_bytes([b[0], b[1]]) as i32;
-            self.sum_sq += (v * v) as f64;
-            self.count += 1;
-            self.peak = self.peak.max(v.abs());
-        }
-    }
-
-    fn rms_peak(&self) -> (u32, i32) {
-        let rms = if self.count == 0 { 0.0 } else { (self.sum_sq / self.count as f64).sqrt() };
-        (rms.round() as u32, self.peak)
-    }
-
-    /// `(rms, peak)` and a reset, once `every` has passed since the last report.
-    fn take_if_older(&mut self, every: Duration) -> Option<(u32, i32)> {
-        if self.since.elapsed() < every {
-            return None;
-        }
-        let r = self.rms_peak();
-        *self = Self::new();
-        Some(r)
-    }
-}
-
-/// The alert stream: our generated ringtone, looped at the RTP packet cadence,
-/// until the line stops ringing (the caller drops this future). Not parec: the
-/// dashboard's own audio is irrelevant while ringing and the tone must not
-/// depend on PulseAudio being healthy.
-async fn run_ringtone_rtp(sock: tokio::net::UdpSocket, dst: SocketAddr, mut cipher: AudioRtpCipher, rate: u32, channels: u32) {
-    let packet_bytes = AUDIO_FRAMES_PER_PACKET as usize * channels as usize * 2;
-    let packet_period = Duration::from_micros(AUDIO_FRAMES_PER_PACKET as u64 * 1_000_000 / rate as u64);
-    let tone = crate::stream::call::ringtone_cycle(rate, channels);
-    info!("audio: ringing — ringtone {rate} Hz {channels}ch → {dst} (cipher={})", cipher.name());
-    let (mut seq, mut ts, mut at) = (0u16, 0u32, 0usize);
-    let mut pkt_pcm = vec![0u8; packet_bytes];
-    let mut tick = tokio::time::interval(packet_period);
-    loop {
-        tick.tick().await;
-        // Copy one packet out of the cycle, wrapping around its end.
-        for b in pkt_pcm.iter_mut() {
-            *b = tone[at];
-            at = (at + 1) % tone.len();
-        }
-        let pkt = cipher.build_packet(seq, ts, 0, &pkt_pcm);
-        if let Err(e) = sock.send_to(&pkt, dst).await {
-            warn!("audio: ringtone send_to {dst} failed: {e:#} — stopping");
-            return;
-        }
-        seq = seq.wrapping_add(1);
-        ts = ts.wrapping_add(AUDIO_FRAMES_PER_PACKET);
-    }
-}
-
-/// Stream audio RTP to the car for the whole session. Tries live PCM capture
-/// (`parec`); if capture is unavailable or ends, it falls back to CONTINUOUS
-/// SILENCE so the negotiated stream stays live — a complete CarPlay session has
-/// audio *data flowing*, not just an open port, and the car's ~7.8 s completion
-/// watchdog appears to require it. Every payload is framed + encrypted by
-/// `cipher` to match the session encryption.
-async fn run_audio_rtp(sock: tokio::net::UdpSocket, dst: SocketAddr, mut cipher: AudioRtpCipher, rate: u32, channels: u32) {
-    // 16-bit samples.
-    let packet_bytes = AUDIO_FRAMES_PER_PACKET as usize * channels as usize * 2;
-    let packet_period = Duration::from_micros(AUDIO_FRAMES_PER_PACKET as u64 * 1_000_000 / rate as u64);
-    let ssrc: u32 = 0;
-    let mut seq: u16 = 0;
-    let mut ts: u32 = 0;
-    let mut sent: u64 = 0;
-    // What we actually send: music vs silence is invisible otherwise.
-    let mut level = PcmLevel::new();
-
-    let device = std::env::var("RASCAR_AUDIO_SOURCE").ok().filter(|s| !s.is_empty());
-    let silence = vec![0u8; packet_bytes];
-    // Car drive 2026-09-28: capture died 2 ms after starting and the session
-    // then sent silence for the whole trip. Now silence only bridges the gap
-    // while capture is (re)started, retried every few seconds.
-    const RETRY: Duration = Duration::from_secs(3);
-    let mut failures: u32 = 0;
-    loop {
-        // parec resamples the Pi's output to what the stream carries.
-        let mut capture = AudioCapture::new(rate, channels);
-        match capture.start(device.as_deref()).await {
-            Ok(()) => {
-                info!("audio: streaming PCM {rate} Hz {channels}ch → {dst} (cipher={}, PT={AUDIO_PAYLOAD_TYPE})", cipher.name());
-                let started = Instant::now();
-                let mut last_data = Instant::now();
-                let mut pcm: Vec<u8> = Vec::with_capacity(packet_bytes * 2);
-                let mut read_buf = vec![0u8; packet_bytes * 2];
-                loop {
-                    // While nothing plays, PulseAudio suspends the output and its
-                    // monitor delivers no data at all (not zeros): once nothing has
-                    // come for 200 ms, fill with silence at the packet cadence
-                    // (5 packets ≈ 37 ms ≈ the read timeout) so the car never sees
-                    // a stalled stream. Normal gaps between parec chunks (20 ms
-                    // latency) never reach that, so music is never padded.
-                    match tokio::time::timeout(packet_period * 5, capture.read_chunk(&mut read_buf)).await {
-                        Err(_) => {
-                            if last_data.elapsed() > Duration::from_millis(200) {
-                                pcm.extend(std::iter::repeat_n(0u8, packet_bytes * 5));
-                            }
-                        }
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(n)) => {
-                            last_data = Instant::now();
-                            pcm.extend_from_slice(&read_buf[..n]);
-                        }
-                        Ok(Err(e)) => {
-                            warn!("audio: capture read error: {e:#}");
-                            break;
-                        }
-                    }
-                    while pcm.len() >= packet_bytes {
-                        level.add(&pcm[..packet_bytes]);
-                        if let Some((rms, peak)) = level.take_if_older(AUDIO_LEVEL_EVERY) {
-                            info!("audio: level sent to the car over the last {}s: rms={rms} peak={peak} (packets={sent})", AUDIO_LEVEL_EVERY.as_secs());
-                        }
-                        let pkt = cipher.build_packet(seq, ts, ssrc, &pcm[..packet_bytes]);
-                        if let Err(e) = sock.send_to(&pkt, dst).await {
-                            warn!("audio: send_to {dst} failed: {e:#} — stopping");
-                            capture.stop().await;
-                            return;
-                        }
-                        seq = seq.wrapping_add(1);
-                        ts = ts.wrapping_add(AUDIO_FRAMES_PER_PACKET);
-                        sent += 1;
-                        if crate::debug::sampled(sent - 1, 3, 300) {
-                            debug!("audio: RTP packet #{sent} (seq={seq}, ts={ts})");
-                        }
-                        pcm.drain(..packet_bytes);
-                    }
-                }
-                capture.stop().await;
-                let lived = started.elapsed();
-                // An immediate EOF is a failure (see parec's own message above), not an end.
-                if lived < Duration::from_secs(1) {
-                    failures += 1;
-                    warn!("audio: capture ended after {} ms (failure #{failures}) — silence, retry in {}s", lived.as_millis(), RETRY.as_secs());
-                } else {
-                    failures = 0;
-                    info!("audio: capture ended after {:.0}s — silence, retry in {}s", lived.as_secs_f32(), RETRY.as_secs());
-                }
-            }
-            Err(e) => {
-                failures += 1;
-                if failures <= 3 || failures % 20 == 0 {
-                    warn!("audio: capture start failed (#{failures}): {e:#} — silence, retry in {}s", RETRY.as_secs());
-                }
-            }
-        }
-        // Keep the car's stream fed while waiting: zeroed PCM at the packet
-        // cadence (352 frames: 7.333 ms at 48 kHz, 22 ms at 16 kHz).
-        let mut tick = tokio::time::interval(packet_period);
-        let until = Instant::now() + RETRY;
-        while Instant::now() < until {
-            tick.tick().await;
-            let pkt = cipher.build_packet(seq, ts, ssrc, &silence);
-            if let Err(e) = sock.send_to(&pkt, dst).await {
-                warn!("audio: silence send_to {dst} failed: {e:#} — stopping");
-                return;
-            }
-            seq = seq.wrapping_add(1);
-            ts = ts.wrapping_add(AUDIO_FRAMES_PER_PACKET);
-            sent += 1;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2824,10 +1949,6 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
     // step 5 (initial screen sync).
     log_info_modes(&resp.body);
     let info_screen_take = info_screen_take_constraint(&resp.body);
-    let telephony = telephony_mode_from_info(&resp.body);
-    info!("← /info telephony: {telephony:?} (meetings use the car microphone when Some)");
-    let alert = alert_mode_from_info(&resp.body);
-    info!("← /info alert: {alert:?} (incoming modem calls ring on it when Some)");
     // Which keepalive form refreshes the receiver's screen-activity timestamp.
     // A zero-body frame is rejected before opcode dispatch on at least the Harman
     // MHI2Q receiver, so getting this wrong silently starves the watchdog while
@@ -2952,31 +2073,14 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
     // --- 6+7. SETUP / (per-stream, type 110) and open the screen data channel ---
     let screen = open_screen_stream(&mut rtsp, peer, &display_uuid).await?;
 
-    // --- 8. Render the dashboard and start the encoder ---
-    // The capture surface is sized to the car's negotiated dims (or, if a real
-    // kiosk `:0` already exists, to its actual geometry). Capture/encode at the
-    // EFFECTIVE geometry so x11grab never asks for a region larger than the root.
-    let (_render_guard, cap_w, cap_h) =
-        render::ensure_dashboard(width, height).await.context("render dashboard")?;
-
-    // Touch injector: map the car's HID logical space to the dashboard surface.
-    // `(width, height)` is the display size, NOT the touch range — see HID_TOUCH_LOGICAL.
-    // Wayland: no X display to drive with XTest — an empty display selects the
-    // uinput touchscreen, which the compositor reads through libinput.
-    let wayland = render::wayland_target();
-    let touch_display = if wayland.is_some() { String::new() } else { render::x_display() };
-    let _touch_task = spawn_touch_injector(touch_rx, HID_TOUCH_LOGICAL, (cap_w, cap_h), touch_display);
+    // --- 8. Start the encoder at the car's negotiated display size ---
+    // The H.264 encoders want even dimensions.
+    let (cap_w, cap_h) = (width & !1, height & !1);
+    let _touch_task = spawn_touch_injector(touch_rx, HID_TOUCH_LOGICAL, (cap_w, cap_h));
 
     let mut encoder = VideoEncoder::new(VideoSettings {
-        display: render::x_display(),
-        wayland,
         width: cap_w,
         height: cap_h,
-        // GOP from VideoSettings (IDR every 0.5 s by default). This used to force
-        // an IDR on every frame, which spent the whole bitrate on intra frames
-        // and made the car's screen blocky. A forceKeyFrame is still honoured:
-        // `stream_screen` withholds frames until the next IDR and resends the
-        // VideoConfig with it.
         ..Default::default()
     });
     encoder.start().await.context("start ffmpeg encoder")?;
@@ -2996,13 +2100,6 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
     // TEARDOWN can all use it (it is no longer moved into the feedback task).
     let rtsp: SharedRtsp = Arc::new(Mutex::new(rtsp));
 
-    // Audio: default ON (gate with RASCAR_CARPLAY_AUDIO=off). Spawned ENTIRELY on
-    // its own task on the shared control channel, so neither its SETUP nor its
-    // RTP stream can ever block the picture (the day-1 failure where a
-    // never-answered audio SETUP was awaited inline and stalled the video loop).
-    // Audio encryption follows the session (ChaCha when paired, else plaintext),
-    // matching the screen and catplay's proven TX.
-    let audio_task = maybe_start_audio(rtsp.clone(), peer, paired_secret.clone(), telephony, alert);
 
     // Every accepted car `changeModes` is followed by our `modesChanged` with the
     // resulting state (catplay `car_manager.rs` `flush_modes`).
@@ -3188,13 +2285,9 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
     if let Some(t) = keepalive_task {
         t.abort();
     }
-    if let Some(t) = audio_task {
-        t.abort();
-    }
     encoder.stop().await;
     // Send TEARDOWN on the control channel (media data socket already dropped).
     send_teardown(&rtsp, &display_uuid).await;
-    // _render_guard drops here (kills Xvfb/Chromium if we started them).
     stream_result
 }
 
@@ -3226,7 +2319,7 @@ async fn stream_screen(
     keepalive.tick().await; // consume the immediate first tick
 
     let mut buf = vec![0u8; 256 * 1024];
-    info!("**** STREAMING dashboard to car **** ({width}x{height}, screen cipher = {})", cipher.name());
+    info!("**** STREAMING to car **** ({width}x{height}, screen cipher = {})", cipher.name());
 
     loop {
         tokio::select! {
@@ -4090,91 +3183,8 @@ mod tests {
         assert_eq!(plist_int(&bplist::Value::String("media".into())), None);
     }
 
-    /// The Jaguar's `/info.audioFormats` (2026-09-29 pcap): every number is a string.
-    #[test]
-    fn jaguar_string_audio_formats_give_telephony() {
-        let entry = |ty: &str, at: &str, inp: Option<&str>, out: &str| {
-            let mut d = plist::Dictionary::new();
-            d.insert("type".into(), ty.into());
-            d.insert("audioType".into(), at.into());
-            if let Some(i) = inp {
-                d.insert("audioInputFormats".into(), i.into());
-            }
-            d.insert("audioOutputFormats".into(), out.into());
-            bplist::Value::Dictionary(d)
-        };
-        let list = vec![
-            entry("100", "compatibility", Some("0x54"), "0x854"),
-            entry("101", "compatibility", None, "0x8000"),
-            entry("100", "media", None, "0x8000"),
-            entry("100", "alert", None, "0x800"),
-            entry("100", "telephony", Some("0x54"), "0x54"),
-            entry("100", "speechRecognition", Some("0x40"), "0x40"),
-        ];
-        let mut d = plist::Dictionary::new();
-        d.insert("audioFormats".into(), bplist::Value::Array(list));
-        let info = bplist::to_bytes(&bplist::Value::Dictionary(d)).unwrap();
-        // 0x54 = 8k | 16k | 24k mono: we prefer 24 kHz.
-        assert_eq!(telephony_mode_from_info(&info), Some(AudioMode::Telephony { format: 1 << 6, rate: 24000 }));
-        // alert "0x800" = kAirPlayAudioFormat_PCM_44KHz_16Bit_Stereo (AirPlayCommon.h:347).
-        assert_eq!(alert_mode_from_info(&info), Some(AudioMode::Alert { format: 0x800, rate: 44100, channels: 2 }));
-    }
 
-    #[test]
-    fn pcm_level_reads_big_endian() {
-        let mut l = PcmLevel::new();
-        // +1000 and -1000, big-endian.
-        l.add(&[0x03, 0xE8, 0xFC, 0x18]);
-        assert_eq!(l.rms_peak(), (1000, 1000));
-        assert_eq!(l.take_if_older(Duration::from_secs(3600)), None);
-        let (rms, peak) = l.take_if_older(Duration::ZERO).unwrap();
-        assert_eq!((rms, peak), (1000, 1000));
-        assert_eq!(l.rms_peak(), (0, 0));
-    }
 
-    #[test]
-    fn modes_changed_body_matches_reference_default_state() {
-        let body = build_modes_changed_body(false).unwrap();
-        let v = bplist::from_bytes(&body).unwrap();
-        let d = v.as_dictionary().unwrap();
-        assert_eq!(d.get("type").unwrap().as_string(), Some("modesChanged"));
-        let params = d.get("params").unwrap().as_dictionary().unwrap();
-        // resources: BOTH MainScreen(1) and MainAudio(2) are claimed by the
-        // Controller(1).
-        //
-        // This test previously asserted MainAudio -> Accessory(2), with a comment
-        // claiming that is what the reference transmitter does. That was wrong.
-        // catplay `modes/change_modes.rs` documents its initial state as
-        // "granting all resources to the `Controller`" and lists
-        // `InitialPermanentEntity::controller(MainAudio)` +
-        // `...controller(MainScreen)`, with the accessory variants commented out.
-        // Verified against the source 2026-09-21.
-        //
-        // The claim is env-overridable, so skip when a developer shell pins it.
-        if std::env::var("RASCAR_CARPLAY_AUDIO").is_ok()
-            || std::env::var("RASCAR_MODES_CLAIM_AUDIO").is_ok()
-        {
-            return;
-        }
-        let res = params.get("resources").unwrap().as_array().unwrap();
-        assert_eq!(res.len(), 2);
-        for (i, id, entity) in [(0usize, 1i64, 1i64), (1, 2, 1)] {
-            let r = res[i].as_dictionary().unwrap();
-            assert_eq!(r.get("resourceID").unwrap().as_signed_integer(), Some(id));
-            assert_eq!(r.get("entity").unwrap().as_signed_integer(), Some(entity));
-            assert_eq!(r.get("permanentEntity").unwrap().as_signed_integer(), Some(entity));
-        }
-        // appStates: phoneCall(2)/turnByTurn(3) None(0); speech(1) None(0) speechMode=-1.
-        let app = params.get("appStates").unwrap().as_array().unwrap();
-        assert_eq!(app.len(), 3);
-        let a0 = app[0].as_dictionary().unwrap();
-        assert_eq!(a0.get("appStateID").unwrap().as_signed_integer(), Some(2));
-        assert_eq!(a0.get("entity").unwrap().as_signed_integer(), Some(0));
-        assert!(a0.get("speechMode").is_none());
-        let a2 = app[2].as_dictionary().unwrap();
-        assert_eq!(a2.get("appStateID").unwrap().as_signed_integer(), Some(1));
-        assert_eq!(a2.get("speechMode").unwrap().as_signed_integer(), Some(-1));
-    }
 
     /// `/info` body carrying only `modes.resources`, as the Jaguar sends it.
     fn info_with_screen_mode(screen: Vec<(&str, i64)>) -> Vec<u8> {
@@ -4269,18 +3279,6 @@ mod tests {
         (plist_int(a.get("entity").unwrap()).unwrap(), plist_int(a.get("permanentEntity").unwrap()).unwrap())
     }
 
-    #[test]
-    fn state_modes_changed_reports_the_audio_borrow_then_its_release() {
-        if std::env::var("RASCAR_CARPLAY_AUDIO").is_ok() || std::env::var("RASCAR_MODES_CLAIM_AUDIO").is_ok() {
-            return;
-        }
-        // During the car's Borrow: the car is the current entity, we stay the owner.
-        let borrowed = state_modes_changed_body(false, false, false, true).unwrap();
-        assert_eq!(main_audio_entities(&borrowed), (ENTITY_ACCESSORY, ENTITY_CONTROLLER));
-        // After its Unborrow: ours again, in both fields.
-        let released = state_modes_changed_body(false, false, false, false).unwrap();
-        assert_eq!(main_audio_entities(&released), (ENTITY_CONTROLLER, ENTITY_CONTROLLER));
-    }
 
     #[test]
     fn change_modes_response_body_is_status0_with_params() {
@@ -4305,127 +3303,10 @@ mod tests {
         assert!(parse_hid_touch(&[0x01, 0x02]).is_none());
     }
 
-    #[test]
-    fn audio_setup_body_and_port_extraction() {
-        let body = build_audio_setup(4242, 55555, AudioMode::Media, None).unwrap();
-        let v = bplist::from_bytes(&body).unwrap();
-        let s = v.as_dictionary().unwrap().get("streams").unwrap().as_array().unwrap()[0]
-            .as_dictionary()
-            .unwrap();
-        assert_eq!(s.get("type").unwrap().as_signed_integer(), Some(100));
-        assert_eq!(s.get("audioType").unwrap().as_string(), Some("media"));
-        assert_eq!(s.get("audioFormat").unwrap().as_signed_integer(), Some(1 << 15));
-        assert_eq!(s.get("audioLatencyMs").unwrap().as_signed_integer(), Some(AUDIO_LATENCY_MS));
-        assert_eq!(s.get("streamConnectionID").unwrap().as_signed_integer(), Some(4242));
-        // Matches catplay StreamDescriptionAudio exactly: bool fields present …
-        assert_eq!(s.get("input").unwrap().as_boolean(), Some(false));
-        assert_eq!(s.get("supportsRTPPacketRedundancy").unwrap().as_boolean(), Some(false));
-        assert_eq!(s.get("supportsHighAccuracyTimestamps").unwrap().as_boolean(), Some(true));
-        // … and NO screen-only `uuid`, NO per-stream encryption key.
-        assert!(s.get("uuid").is_none());
-        assert!(s.get("ekey").is_none());
-        assert!(s.get("eiv").is_none());
 
-        // Unencrypted session → streamConnectionID must be 0 (catplay's et=NONE value).
-        let body0 = build_audio_setup(0, 55555, AudioMode::Media, None).unwrap();
-        let v0 = bplist::from_bytes(&body0).unwrap();
-        let s0 = v0.as_dictionary().unwrap().get("streams").unwrap().as_array().unwrap()[0]
-            .as_dictionary()
-            .unwrap();
-        assert_eq!(s0.get("streamConnectionID").unwrap().as_signed_integer(), Some(0));
 
-        // A reply with a type-100 dataPort + controlPort.
-        let mut rs = plist::Dictionary::new();
-        rs.insert("type".into(), 100i64.into());
-        rs.insert("dataPort".into(), 50000i64.into());
-        rs.insert("controlPort".into(), 50001i64.into());
-        let mut reply = plist::Dictionary::new();
-        reply.insert("streams".into(), bplist::Value::Array(vec![bplist::Value::Dictionary(rs)]));
-        let reply = bplist::Value::Dictionary(reply);
-        assert_eq!(extract_audio_ports(&reply, 100), (Some(50000), Some(50001)));
-        assert_eq!(extract_audio_ports(&reply, 110), (None, None));
-    }
 
-    #[test]
-    fn telephony_setup_asks_for_the_microphone() {
-        let mode = AudioMode::Telephony { format: 1 << 4, rate: 16000 };
-        let body = build_audio_setup(7, 55555, mode, Some(40000)).unwrap();
-        let v = bplist::from_bytes(&body).unwrap();
-        let s = v.as_dictionary().unwrap().get("streams").unwrap().as_array().unwrap()[0].as_dictionary().unwrap();
-        assert_eq!(s.get("type").unwrap().as_signed_integer(), Some(100));
-        assert_eq!(s.get("audioType").unwrap().as_string(), Some("telephony"));
-        assert_eq!(s.get("audioFormat").unwrap().as_signed_integer(), Some(1 << 4));
-        assert_eq!(s.get("input").unwrap().as_boolean(), Some(true));
-        assert_eq!(s.get("dataPort").unwrap().as_signed_integer(), Some(40000));
-        // Media never carries a dataPort.
-        let m = build_audio_setup(7, 55555, AudioMode::Media, Some(40000)).unwrap();
-        let v = bplist::from_bytes(&m).unwrap();
-        let s = v.as_dictionary().unwrap().get("streams").unwrap().as_array().unwrap()[0].as_dictionary().unwrap();
-        assert!(s.get("dataPort").is_none());
-        assert_eq!(s.get("input").unwrap().as_boolean(), Some(false));
-    }
 
-    #[test]
-    fn alert_setup_is_output_only_in_the_cars_format() {
-        let mode = AudioMode::Alert { format: 1 << 11, rate: 44100, channels: 2 };
-        let body = build_audio_setup(7, 55555, mode, Some(40000)).unwrap();
-        let v = bplist::from_bytes(&body).unwrap();
-        let s = v.as_dictionary().unwrap().get("streams").unwrap().as_array().unwrap()[0].as_dictionary().unwrap();
-        assert_eq!(s.get("type").unwrap().as_signed_integer(), Some(100));
-        assert_eq!(s.get("audioType").unwrap().as_string(), Some("alert"));
-        assert_eq!(s.get("audioFormat").unwrap().as_signed_integer(), Some(1 << 11));
-        assert_eq!(s.get("input").unwrap().as_boolean(), Some(false));
-        assert!(s.get("dataPort").is_none());
-        assert_eq!((mode.rate(), mode.channels(), mode.is_call()), (44100, 2, false));
-    }
-
-    #[test]
-    fn alert_only_when_the_car_lists_it() {
-        // No alert entry, or no audioFormats at all: never an alert stream
-        // (unlike telephony, which has a fallback).
-        assert_eq!(alert_mode_from_info(&info_with(vec![(100, "media", None, Some(1 << 15))])), None);
-        let mut d = plist::Dictionary::new();
-        d.insert("displays".into(), bplist::Value::Array(vec![]));
-        assert_eq!(alert_mode_from_info(&bplist::to_bytes(&bplist::Value::Dictionary(d)).unwrap()), None);
-        assert_eq!(alert_mode_from_info(b"not a plist"), None);
-        // Listed but only in formats we do not generate (24-bit): none.
-        assert_eq!(alert_mode_from_info(&info_with(vec![(100, "alert", None, Some(1 << 13))])), None);
-        // 48 kHz stereo only (catplay receiver also offers it).
-        assert_eq!(
-            alert_mode_from_info(&info_with(vec![(100, "alert", None, Some(1 << 15))])),
-            Some(AudioMode::Alert { format: 1 << 15, rate: 48000, channels: 2 })
-        );
-        // An alt-audio (type 101) "alert" entry is not a main-audio alert.
-        assert_eq!(alert_mode_from_info(&info_with(vec![(101, "alert", None, Some(1 << 11))])), None);
-    }
-
-    #[test]
-    fn line_state_picks_the_stream() {
-        use crate::stream::call::Line;
-        let tel = Some(AudioMode::Telephony { format: 1 << 6, rate: 24000 });
-        let alert = Some(AudioMode::Alert { format: 1 << 11, rate: 44100, channels: 2 });
-        let idle = Line { call: false, ring: false };
-        let ring = Line { call: false, ring: true };
-        let call = Line { call: true, ring: false };
-        let both = Line { call: true, ring: true };
-        assert_eq!(desired_audio_mode(idle, tel, alert), AudioMode::Media);
-        assert_eq!(desired_audio_mode(ring, tel, alert), alert.unwrap());
-        assert_eq!(desired_audio_mode(call, tel, alert), tel.unwrap());
-        // Ringing during a meeting/call: the call keeps the car's audio.
-        assert_eq!(desired_audio_mode(both, tel, alert), tel.unwrap());
-        // A car without an alert stream keeps media while ringing.
-        assert_eq!(desired_audio_mode(ring, tel, None), AudioMode::Media);
-        // Without telephony a call keeps media, and a ring during it can still ring.
-        assert_eq!(desired_audio_mode(call, None, alert), AudioMode::Media);
-        assert_eq!(desired_audio_mode(both, None, alert), alert.unwrap());
-        // phoneCall is announced for telephony, not for media, and not for an
-        // alert unless the A/B flag asks for it (unset in tests).
-        assert!(announces_phone_call(tel.unwrap()));
-        assert!(!announces_phone_call(AudioMode::Media));
-        if std::env::var_os("RASCAR_PHONE_RING_CALLSTATE").is_none() {
-            assert!(!announces_phone_call(alert.unwrap()));
-        }
-    }
 
     fn info_with(formats: Vec<(i64, &str, Option<i64>, Option<i64>)>) -> Vec<u8> {
         let list = formats
@@ -4448,106 +3329,10 @@ mod tests {
         bplist::to_bytes(&bplist::Value::Dictionary(d)).unwrap()
     }
 
-    #[test]
-    fn telephony_format_follows_the_car() {
-        // catplay receiver defaults: 16/24/32 kHz mono both ways → 24 kHz preferred.
-        let both = (1 << 4) | (1 << 6) | (1 << 8);
-        let info = info_with(vec![(100, "media", None, Some(1 << 15)), (100, "telephony", Some(both), Some(both))]);
-        assert_eq!(telephony_mode_from_info(&info), Some(AudioMode::Telephony { format: 1 << 6, rate: 24000 }));
-        // Only 16 kHz offered in BOTH directions.
-        let info = info_with(vec![(100, "telephony", Some(1 << 4), Some((1 << 4) | (1 << 6)))]);
-        assert_eq!(telephony_mode_from_info(&info), Some(AudioMode::Telephony { format: 1 << 4, rate: 16000 }));
-        // A list without telephony: no hands-free path.
-        let info = info_with(vec![(100, "media", None, Some(1 << 15))]);
-        assert_eq!(telephony_mode_from_info(&info), None);
-        // No list at all: catplay's 16 kHz default.
-        let empty = bplist::to_bytes(&bplist::Value::Dictionary(Default::default())).unwrap();
-        assert_eq!(telephony_mode_from_info(&empty), Some(AudioMode::Telephony { format: 1 << 4, rate: 16000 }));
-    }
 
-    #[test]
-    fn car_microphone_packets_decrypt_with_the_input_key() {
-        let secret = [9u8; 32];
-        let scid = 123_456;
-        // What the car does: seal with the Input key (catplay receiver write cipher).
-        let key = crate::stream::crypto::derive_chacha_input_key(&secret, scid).unwrap();
-        let mut car = AudioRtpCipher::ChaCha { aead: Box::new(ChaCha20Poly1305::new_from_slice(&key).unwrap()), counter: 5 };
-        let pcm: Vec<u8> = (0..704u32).map(|i| i as u8).collect();
-        let pkt = car.build_packet(3, 352, 0, &pcm);
-        let mic = MicCipher::from_session(Some(&secret), scid);
-        assert_eq!(mic.open(&pkt).as_deref(), Some(&pcm[..]));
-        // Our own (Output-key) packets must NOT verify as microphone data.
-        let mut ours = AudioRtpCipher::from_session(Some(&secret), scid);
-        assert!(mic.open(&ours.build_packet(3, 352, 0, &pcm)).is_none());
-        // Plaintext session: payload after the 12-byte header.
-        assert_eq!(MicCipher::None.open(&AudioRtpCipher::None.build_packet(1, 0, 0, &pcm)).as_deref(), Some(&pcm[..]));
-        assert!(MicCipher::None.open(&[0u8; 4]).is_none());
-    }
 
-    #[test]
-    fn modes_changed_announces_the_call() {
-        let body = build_modes_changed_body(true).unwrap();
-        let v = bplist::from_bytes(&body).unwrap();
-        let app = v.as_dictionary().unwrap().get("params").unwrap().as_dictionary().unwrap().get("appStates").unwrap().as_array().unwrap().clone();
-        let call = app[0].as_dictionary().unwrap();
-        assert_eq!(call.get("appStateID").unwrap().as_signed_integer(), Some(2));
-        assert_eq!(call.get("entity").unwrap().as_signed_integer(), Some(ENTITY_CONTROLLER));
-    }
 
-    #[test]
-    fn audio_rtp_plaintext_packet_framing() {
-        let mut c = AudioRtpCipher::None;
-        let pcm = [0xABu8; 32];
-        let pkt = c.build_packet(7, 0x0000_0160, 0, &pcm);
-        // 12-byte RTP header + raw payload, no tag/nonce trailer.
-        assert_eq!(pkt.len(), 12 + pcm.len());
-        assert_eq!(pkt[0], 2u8 << 6); // v=2
-        assert_eq!(pkt[1], AUDIO_PAYLOAD_TYPE);
-        assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 7); // seq
-        assert_eq!(&pkt[12..], &pcm);
-    }
 
-    #[test]
-    fn audio_rtp_chacha_packet_roundtrips_reference_layout() {
-        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-        use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-
-        // A paired session ChaCha-encrypts audio exactly like the screen; the
-        // packet layout is catplay's `[hdr 12][ct N][tag 16][nonce 8]`.
-        let secret = [0x42u8; 32];
-        let scid: i64 = 1234;
-        let mut c = AudioRtpCipher::from_session(Some(&secret), scid);
-        assert_eq!(c.name(), "chacha20-poly1305");
-
-        let pcm = [0x5Au8; 64];
-        let (seq, ts, ssrc) = (9u16, 0xDEAD_BEEFu32, 0x1122_3344u32);
-        let pkt = c.build_packet(seq, ts, ssrc, &pcm);
-        assert_eq!(pkt.len(), 12 + pcm.len() + 16 + 8);
-        assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), seq);
-        assert_eq!(u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]), ts);
-        assert_eq!(u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]), ssrc);
-
-        // Decrypt as catplay's receiver does: key = DataStream-Output (same as TX),
-        // nonce read from the 8-byte trailer, AAD = (ts<<32|ssrc) big-endian.
-        let n = pkt.len();
-        let nonce_ctr = u64::from_le_bytes(pkt[n - 8..].try_into().unwrap());
-        assert_eq!(nonce_ctr, 0, "first packet nonce counter starts at 0");
-        let ciphertext = &pkt[12..n - 8]; // ct + tag
-        let mut nonce = [0u8; 12];
-        nonce[4..].copy_from_slice(&nonce_ctr.to_le_bytes());
-        let aad = (((ts as u64) << 32) | ssrc as u64).to_be_bytes();
-        let key = crate::stream::crypto::derive_chacha_key(&secret, scid).unwrap();
-        let aead = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-        let pt = aead
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad: &aad })
-            .expect("catplay-layout decrypt");
-        assert_eq!(pt, pcm);
-
-        // The nonce counter advances per packet.
-        let pkt2 = c.build_packet(seq + 1, ts, ssrc, &pcm);
-        let n2 = pkt2.len();
-        assert_eq!(u64::from_le_bytes(pkt2[n2 - 8..].try_into().unwrap()), 1);
-    }
 
     #[test]
     fn command_type_and_hid_report_extract() {
@@ -4677,31 +3462,6 @@ mod keepalive_interval_tests {
 mod modes_reference_alignment_tests {
     use super::*;
 
-    /// catplay's initial state grants BOTH resources to the Controller
-    /// (`modes/change_modes.rs`, accessory variants commented out). Our
-    /// `modesChanged` must say the same thing, because that message is what
-    /// tells the head unit who owns the screen and the audio.
-    #[test]
-    fn both_resources_go_to_the_controller_by_default() {
-        let params = build_modes_params(false);
-        let resources = params
-            .get("resources")
-            .and_then(|v| v.as_array())
-            .expect("modesChanged must carry a resources array");
-        let mut seen = std::collections::HashMap::new();
-        for r in resources {
-            let d = r.as_dictionary().expect("resource entry must be a dict");
-            let id = d.get("resourceID").and_then(|v| v.as_signed_integer()).expect("resourceID");
-            let entity = d.get("entity").and_then(|v| v.as_signed_integer()).expect("entity");
-            seen.insert(id, entity);
-        }
-        // Guard against the env overriding the default in a developer shell.
-        if std::env::var("RASCAR_CARPLAY_AUDIO").is_ok() || std::env::var("RASCAR_MODES_CLAIM_AUDIO").is_ok() {
-            return;
-        }
-        assert_eq!(seen.get(&RESOURCE_MAIN_SCREEN), Some(&ENTITY_CONTROLLER), "MainScreen -> Controller");
-        assert_eq!(seen.get(&RESOURCE_MAIN_AUDIO), Some(&ENTITY_CONTROLLER), "MainAudio -> Controller");
-    }
 
     /// The claim and the audio SETUP must never disagree again: telling the car
     /// "you own the audio" and then demanding the audio stream is the
@@ -4758,21 +3518,7 @@ mod encryption_type_tests {
 mod hid_touch_scaling_tests {
     use super::*;
 
-    #[test]
-    fn hid_logical_range_maps_across_the_whole_dashboard() {
-        let dash = (1200, 512);
-        // Real 5-byte report: down, X=16384, Y=16384 → centre of the dashboard.
-        let t = parse_hid_touch(&[0x01, 0x00, 0x40, 0x00, 0x40]).unwrap();
-        assert_eq!(map_coords(t.x as u32, t.y as u32, HID_TOUCH_LOGICAL, dash), (600, 256));
-        assert_eq!(map_coords(0, 0, HID_TOUCH_LOGICAL, dash), (0, 0));
-        assert_eq!(map_coords(32767, 32767, HID_TOUCH_LOGICAL, dash), (1199, 511));
-    }
 
-    #[test]
-    fn display_size_as_source_would_pin_touches_to_the_corner() {
-        // Regression guard: the old call passed the panel size as the source range.
-        assert_eq!(map_coords(16384, 16384, (1200, 512), (1200, 512)), (1199, 511));
-    }
 
     /// `(entity, permanentEntity)` of one resource in a modes `params` dict.
     fn resource_pair(p: &plist::Dictionary, id: i64) -> (i64, i64) {
@@ -4794,24 +3540,6 @@ mod hid_touch_scaling_tests {
         v.as_dictionary().unwrap().get("params").unwrap().as_dictionary().unwrap().clone()
     }
 
-    /// Hand-back: MainScreen is the car's as entity AND permanentEntity
-    /// (catplay `AccessoryHas`); MainAudio and phoneCall do not move.
-    #[test]
-    fn modes_changed_hands_the_screen_to_the_car_and_back() {
-        let audio_owner = if claims_main_audio() { ENTITY_CONTROLLER } else { ENTITY_ACCESSORY };
-        for phone_call in [false, true] {
-            let car = body_params(&modes_changed_body(phone_call, true).unwrap());
-            assert_eq!(resource_pair(&car, RESOURCE_MAIN_SCREEN), (ENTITY_ACCESSORY, ENTITY_ACCESSORY));
-            assert_eq!(resource_pair(&car, RESOURCE_MAIN_AUDIO), (audio_owner, audio_owner));
-            let ours = body_params(&modes_changed_body(phone_call, false).unwrap());
-            assert_eq!(resource_pair(&ours, RESOURCE_MAIN_SCREEN), (ENTITY_CONTROLLER, ENTITY_CONTROLLER));
-            assert_eq!(resource_pair(&ours, RESOURCE_MAIN_AUDIO), (audio_owner, audio_owner));
-            // appStates identical in both owner states.
-            assert_eq!(car.get("appStates"), ours.get("appStates"));
-            let call = car.get("appStates").unwrap().as_array().unwrap()[0].as_dictionary().unwrap().clone();
-            assert_eq!(call.get("entity").unwrap().as_signed_integer(), Some(if phone_call { ENTITY_CONTROLLER } else { 0 }));
-        }
-    }
 
     /// The ChangeModesResponse snapshot must tell the same screen story as
     /// the last modesChanged, also while the car borrows MainAudio.

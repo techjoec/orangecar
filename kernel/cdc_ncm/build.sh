@@ -8,19 +8,20 @@
 #    (a linux-source tarball in /usr/src if one matches, else kernel.org);
 # 2. applies cdc_ncm-rascar.patch (see kernel/README.md for what it changes);
 # 3. builds it out of tree against /lib/modules/$(uname -r)/build, preparing
-#    Armbian's headers package first if it ships without its host tools;
-# 4. installs the module where the CarPlay runner loads it from:
-#      /usr/local/lib/rascar/modules/$(uname -r)/cdc_ncm.ko
-#    and, unless --no-autoload, also in /lib/modules/$(uname -r)/updates/ so the
+#    the headers package first if it ships without its host tools;
+# 4. installs the module in /usr/local/lib/rascar/modules/$(uname -r)/ and,
+#    unless --no-autoload, also in /lib/modules/$(uname -r)/updates/ so the
 #    module the kernel autoloads is the patched one (the hold parameter defaults
 #    to off, so this is harmless for any other cdc_ncm device).
+#
+# On a Pi Zero W the build is slow (single ARMv6 core): expect several minutes.
 #
 # --dest <dir> installs the module there instead (implies --no-autoload): handy to
 # build and inspect it without touching the system.
 #
 # Run it again after every kernel upgrade: a module only loads into the exact
 # kernel it was built for. It never unloads the module currently in use; the
-# runner (rascar-carplay-run) swaps it before the next CarPlay attempt.
+# patched one is used from the next load (or reboot) on.
 
 set -euo pipefail
 
@@ -40,14 +41,14 @@ while [[ $# -gt 0 ]]; do
         --no-autoload) AUTOLOAD=0; shift ;;
         --src) SRC=$(readlink -f "${2:?--src needs a file}"); shift 2 ;;
         --dest) DEST=${2:?--dest needs a directory}; AUTOLOAD=0; shift 2 ;;
-        -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
         *) die "unknown option $1" ;;
     esac
 done
 
 [[ $EUID -eq 0 ]] || die "run as root (it may prepare the kernel headers and installs into /lib/modules)"
 [[ -f $PATCH ]] || die "$PATCH missing"
-[[ -d $KDIR ]] || die "no kernel build tree at $KDIR — install the headers for $KREL (Armbian: apt install linux-headers-current-<family>, e.g. linux-headers-current-rockchip64)"
+[[ -d $KDIR ]] || die "no kernel build tree at $KDIR — install the headers for $KREL (Raspberry Pi OS on a Pi Zero W: apt install linux-headers-rpi-v6)"
 for t in make gcc patch curl; do
     command -v "$t" >/dev/null || die "$t missing (apt install build-essential patch curl)"
 done
@@ -132,4 +133,4 @@ if (( AUTOLOAD )); then
     depmod -a "$KREL"
     log "installed /lib/modules/$KREL/updates/cdc_ncm.ko + depmod (autoloaded from the next load on)"
 fi
-log "resident now: $(cat /sys/module/cdc_ncm/version 2>/dev/null || echo 'stock or not loaded'); the CarPlay runner swaps it before its next attempt"
+log "resident now: $(cat /sys/module/cdc_ncm/version 2>/dev/null || echo 'stock or not loaded'); reboot (or rmmod cdc_ncm) to use the patched one"

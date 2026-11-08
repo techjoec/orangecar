@@ -5,7 +5,7 @@
 //! a transport-generic iAP2 Device stack, Phase 3 does the hardware dance:
 //!
 //! ```text
-//!   role_switch::switch_to_host          (flip fc000000.usb: peripheral → host)
+//!   role_switch::switch_to_host          (flip the dwc2 OTG port: peripheral → host)
 //!        │
 //!        ├── usb_host::wait_for_car_device   (car enumerates as a USB device)
 //!        │        └── usb_host::UsbHostTransport::open   (claim iAP2 bulk iface)
@@ -144,7 +144,7 @@ where
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
     }
 
-    // Step 1: usb quirk + fusb302 unbind + flip the controller to USB host.
+    // Step 1: usb quirk + flip the controller to USB host.
     // Everything below this point must put the port back if it fails — see
     // `RoleRollback`.  Blocking (sysfs writes + settle delay) → blocking pool.
     let switched = tokio::task::spawn_blocking(role_switch::switch_to_host)
@@ -152,7 +152,6 @@ where
         .context("joining the role-switch task")?
         .context("USB role switch to host")?;
     let mut rollback = RoleRollback(Some(switched));
-    log_typec_vbus_state("after the switch to host");
 
     // Only NOW may automatic driver binding be suppressed.
     //
@@ -704,24 +703,6 @@ pub fn release_ncm_hold_and_bind(car_sysfs: &Path) {
     bind_ncm_now(car_sysfs);
 }
 
-/// Log whether the board drives VBUS on the car's USB-C port.
-///
-/// The car's port already supplies 5 V; if our `vbus5v0_typec` regulator were
-/// enabled too, two supplies would fight on one wire (brown-outs, back-feed).
-/// On the bench it is disabled with no users; this records the state in the car.
-fn log_typec_vbus_state(when: &str) {
-    let Ok(dir) = std::fs::read_dir("/sys/class/regulator") else { return };
-    for entry in dir.flatten() {
-        let path = entry.path();
-        let name = std::fs::read_to_string(path.join("name")).unwrap_or_default();
-        if name.trim() == "vbus5v0_typec" {
-            let state = std::fs::read_to_string(path.join("state")).unwrap_or_default();
-            let users = std::fs::read_to_string(path.join("num_users")).unwrap_or_default();
-            info!("power: vbus5v0_typec {} (users {}) {when}", state.trim(), users.trim());
-            return;
-        }
-    }
-}
 
 /// Whether to reset the car's USB device from the host side right after iAP2
 /// authentication (opt in with `RASCAR_POST_AUTH_RESET=1`).

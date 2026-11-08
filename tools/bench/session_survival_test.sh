@@ -24,17 +24,12 @@ MIN_FRAMES=${MIN_FRAMES:-100}
 [[ -x $BIN ]] || { echo "no binary at $BIN"; exit 2; }
 
 fail=0
-# MEETING=1: rascar-app's meeting heartbeat ("call 1" to 127.0.0.1:7703)
-# from 5 s to 11 s into the session, then "call 0".
 # HANDBACK=1: "screen car" to 127.0.0.1:7704 at 6 s; the sim answers with
 # requestUI 3 s after the hand-back and checks the whole transition.
-# LATE_AUDIO=1: the sim answers the audio SETUP 3.2 s late; media audio must arrive.
 run_case() {
     local label=$1; shift
-    local meeting=0 handback=0 sim_extra=()
-    if [[ ${1:-} == MEETING=1 ]]; then meeting=1; sim_extra=(--expect-meeting); shift; fi
+    local handback=0 sim_extra=()
     if [[ ${1:-} == HANDBACK=1 ]]; then handback=1; sim_extra+=(--expect-handback); shift; fi
-    if [[ ${1:-} == LATE_AUDIO=1 ]]; then sim_extra+=(--audio-setup-delay 3.2 --expect-media-audio); shift; fi
     echo "── $label"
     timeout $((RUN_SECS + 20)) python3 "$SIM" --port "$PORT" \
         --run-secs "$RUN_SECS" --min-survival-secs "$MIN_LIFE" \
@@ -43,12 +38,8 @@ run_case() {
     sleep 1.5
     env "$@" timeout $((RUN_SECS + 10)) "$BIN" --carplay-endpoint "127.0.0.1:$PORT" \
         > "$OUT/$label.snd" 2>&1 &
-    if [[ $meeting -eq 1 ]]; then
-        ( sleep 5; for _ in 1 2 3; do printf 'call 1' > /dev/udp/127.0.0.1/7703; sleep 2; done
-          printf 'call 0' > /dev/udp/127.0.0.1/7703 ) &
-    fi
     if [[ $handback -eq 1 ]]; then
-        # rascar-app's "car screen" button (POST /api/carplay/native) sends this.
+        # "screen car" on 127.0.0.1:7704 hands the screen to the car's own UI.
         ( sleep 6; printf 'screen car' > /dev/udp/127.0.0.1/7704 ) &
     fi
     wait $sim; local rc=$?
@@ -64,16 +55,10 @@ run_case() {
 
 echo "session survival gate — binary: $BIN"
 echo
-# Screen-only: we leave MainAudio to the car, so we must not ask for the stream.
-run_case screen_only RASCAR_SESSION_GATE=1
-# Audio claimed AND streamed — the other self-consistent configuration.
-run_case audio_claimed RASCAR_CARPLAY_AUDIO=on
-# A meeting mid-session: media -> telephony (car mic) -> media.
-run_case meeting MEETING=1 RASCAR_CARPLAY_AUDIO=on
+# Screen only (this build never claims MainAudio, so never asks for its stream).
+run_case screen_only RASCAR_VIDEO_ENCODER=${RASCAR_VIDEO_ENCODER:-x264}
 # Screen handed to the car's native UI at ~6 s, taken back on the car's requestUI.
-run_case handback HANDBACK=1 RASCAR_CARPLAY_AUDIO=on
-# The car answers the audio SETUP 3.2 s late (2026-10-01): audio must still flow.
-run_case late_audio LATE_AUDIO=1 RASCAR_CARPLAY_AUDIO=on
+run_case handback HANDBACK=1 RASCAR_VIDEO_ENCODER=${RASCAR_VIDEO_ENCODER:-x264}
 
 if [[ $fail -eq 0 ]]; then
     echo "RESULT: session survives in every configuration."

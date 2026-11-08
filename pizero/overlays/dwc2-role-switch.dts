@@ -1,0 +1,31 @@
+// dwc2 in OTG mode with a software USB role switch, for the Pi Zero / Zero W.
+//
+// Same as the stock `dwc2` overlay (dr_mode=otg) plus `usb-role-switch`, which
+// makes the dwc2 driver register /sys/class/usb_role/20980000.usb-role-switch.
+// rascar-carplay writes `host` there when the car asks the "iPhone" to become
+// USB host, and `device` to go back. Needs a kernel with CONFIG_USB_ROLE_SWITCH.
+//
+// Build + install (pizero/install.sh does this):
+//   dtc -@ -I dts -O dtb -o /boot/firmware/overlays/dwc2-role-switch.dtbo dwc2-role-switch.dts
+// config.txt:
+//   dtoverlay=dwc2-role-switch
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&usb>;
+		__overlay__ {
+			compatible = "brcm,bcm2835-usb";
+			dr_mode = "otg";
+			usb-role-switch;
+			role-switch-default-mode = "peripheral";
+			g-np-tx-fifo-size = <32>;
+			g-rx-fifo-size = <558>;
+			g-tx-fifo-size = <512 512 512 512 512 256 256>;
+			status = "okay";
+		};
+	};
+};

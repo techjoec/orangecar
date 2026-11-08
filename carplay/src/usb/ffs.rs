@@ -557,7 +557,6 @@ fn answer_setup(file: &File, setup: &Setup, answer: Answer) -> Result<String> {
         Answer::AckOut => {
             let data = ep0_read(file.as_raw_fd(), len).map_err(std::io::Error::from)?;
             let tag = if (setup.request_type, setup.request) == (0x21, 0x09) {
-                forward_hid_report(&data);
                 format!(" SET_REPORT id={}", setup.value & 0xff)
             } else {
                 String::new()
@@ -571,28 +570,6 @@ fn answer_setup(file: &File, setup: &Setup, answer: Answer) -> Result<String> {
                     hex::encode(&data)
                 ))
             }
-        }
-    }
-}
-
-// ── iAP2-over-HID sink ────────────────────────────────────────────────────────
-
-/// Where SET_REPORT data stages go when the device-mode iAP2 responder runs
-/// (see `hid_iap2`). `None` (the default) keeps them log-only.
-static HID_IAP2_SINK: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>> =
-    std::sync::Mutex::new(None);
-
-/// Install (or clear) the receiver of the car's HID Output reports.
-pub fn set_hid_iap2_sink(sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>) {
-    if let Ok(mut slot) = HID_IAP2_SINK.lock() {
-        *slot = sink;
-    }
-}
-
-fn forward_hid_report(data: &[u8]) {
-    if let Ok(slot) = HID_IAP2_SINK.lock() {
-        if let Some(tx) = slot.as_ref() {
-            let _ = tx.send(data.to_vec());
         }
     }
 }
@@ -812,9 +789,6 @@ fn handle_event(ep: &Ep0, setup_count: &mut u64) -> Result<Option<CaptureOutcome
             }
             if setup.request_type == REQTYPE_VENDOR_OUT && setup.request == CARPLAY_ROLE_SWITCH_REQ && setup.value == 0 {
                 info!("**** ROLE-SWITCH wValue=0 **** [c.{c}] car asked the iPhone to STAY USB device (non-CarPlay / InControl path?)");
-                if crate::usb::hid_iap2::enabled() {
-                    crate::usb::hid_iap2::soft_reconnect_after_stay_device();
-                }
             }
             if setup.request_type == 0xC0 && setup.request == CARPLAY_ROLE_READ_REQ {
                 if hide_carplay_capability() {

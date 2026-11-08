@@ -30,14 +30,6 @@ hex = "0.4"
 thiserror = "1"
 async-trait = "0.1"
 nusb = { version = "0.2.5", features = ["tokio"] }
-# Parses rascar-app's /api/media JSON for the iAP2 NowPlaying stream
-# (src/iap2/nowplaying.rs). Already in the workspace lockfile via app/.
-serde_json = { workspace = true }
-# Wayland dashboard capture (stream/wlcapture.rs): wlr-screencopy client.
-wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client"] }
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-memmap2 = "0.9"
 
 # --- Phase 4: AirPlay/CarPlay control + FairPlay SAP ---
 # Ported from doubletake (LGPL-3). See src/airplay/mod.rs for the licensing note.
@@ -57,10 +49,6 @@ rand = "0.8"
 aes = "0.8"
 ctr = "0.9"
 
-# --- Phase 5: dashboard capture + AirPlay video/audio sender + touch return ---
-# X11 XTest touch injection into the Xvfb/Chromium dashboard (copied uinput+XTest
-# injector from bridge/src/media/input.rs). Framebuffer path uses nix+libc above.
-x11rb = { version = "0.13", features = ["xtest"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,5 +1,10 @@
 # Reverse-engineering notes
 
+> **Note:** written for the original Orange Pi 5 Plus build (RK3588, dwc3, Armbian). The protocol
+> findings apply unchanged to the Pi Zero W; paths under `setup/`, the dashboard and board-specific
+> details (dwc3 debugfs, fusb302, NVMe, thermal) no longer exist in this repository.
+
+
 This page explains how the facts in [protocol.md](protocol.md) were found, and how to debug your own car
 with the same tools. Nothing here was given to us: no Apple documentation of the phone side, no head-unit
 logs. Everything came from capturing what the car does, comparing it with other implementations, and

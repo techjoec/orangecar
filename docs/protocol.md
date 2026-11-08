@@ -1,5 +1,10 @@
 # Wired CarPlay from the phone side: a byte-level guide
 
+> **Note:** written for the original Orange Pi 5 Plus build (RK3588, dwc3, Armbian). The protocol
+> findings apply unchanged to the Pi Zero W; paths under `setup/`, the dashboard and board-specific
+> details (dwc3 debugfs, fusb302, NVMe, thermal) no longer exist in this repository.
+
+
 This page explains how to be the **iPhone** in a wired CarPlay connection to a real head unit. It goes
 step by step, in the order the car expects things, from the first USB descriptor read to a running video,
 audio and touch session. It also names the file in `carplay/src` that implements each step.

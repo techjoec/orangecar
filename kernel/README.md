@@ -64,15 +64,15 @@ the file rarely change.
    in the patch as an A/B switch.
 
 The patch also adds `MODULE_VERSION("rascar-3")` and a few `dev_info` lines
-(`RasCar: ...`) to the kernel log. The runner reads
+(`RasCar: ...`) to the kernel log. Read
 `/sys/module/cdc_ncm/version` to tell which module is resident. An older
 patched module carries the same "O" (out-of-tree) taint, so the taint alone
 cannot tell them apart.
 
 ## Building and installing
 
-On the board, with the headers for the running kernel installed
-(Armbian: `linux-headers-current-rockchip64`):
+On the Pi, with the headers for the running kernel installed
+(Raspberry Pi OS on a Pi Zero W: `linux-headers-rpi-v6`):
 
 ```sh
 sudo kernel/cdc_ncm/build.sh
@@ -80,24 +80,16 @@ sudo kernel/cdc_ncm/build.sh
 
 The script fetches the stock `cdc_ncm.c` for `uname -r`. It takes it from a
 matching `/usr/src/linux-source-*` tarball if there is one, and otherwise from
-kernel.org. It then applies the patch, builds the module and installs it to:
+kernel.org. It then applies the patch, builds the module and installs it to
+`/usr/local/lib/rascar/modules/$(uname -r)/` and to
+`/lib/modules/$(uname -r)/updates/cdc_ncm.ko` plus `depmod`, so the module the
+kernel autoloads is the patched one (`--no-autoload` skips this).
 
-- `/usr/local/lib/rascar/modules/$(uname -r)/cdc_ncm.ko`, which
-  `rascar-carplay-run` loads before each attempt (override the path with
-  `RASCAR_CDC_NCM_KO` in `/etc/rascar/carplay.env`);
-- `/lib/modules/$(uname -r)/updates/cdc_ncm.ko` plus `depmod`, so the module the
-  kernel autoloads is the patched one too (`--no-autoload` skips this).
+The patch was made against 6.18.20. If it does not apply to your Raspberry Pi
+kernel, port the hunks by hand; they are small.
 
-Armbian's header packages are built on x86 and can lack the arm64 host tools
-(`scripts/basic/fixdep`, `scripts/mod/modpost`). When they are missing, the
-script runs `make modules_prepare` in the headers tree. It writes a
-`localversion` file first: without it the regenerated `kernel.release` loses
-the `-current-rockchip64` suffix, the module's vermagic no longer matches the
-kernel, and insmod fails with "Invalid module format".
-
-**Rebuild after every kernel upgrade.** The runner logs `cdc_ncm WANTED ... but
-... is resident` when it cannot load the wanted module. That happens when the
-resident module cannot be unloaded, and a reboot fixes it.
+**Rebuild after every kernel upgrade** (or hold the kernel package:
+`sudo apt-mark hold linux-image-rpi-v6 linux-headers-rpi-v6`).
 
 Check what is loaded:
 

@@ -46,7 +46,6 @@
 pub mod control;
 pub mod error;
 pub mod link;
-pub mod nowplaying;
 pub mod packet;
 
 use bytes::Bytes;
@@ -170,9 +169,6 @@ where
                 device_state("Failed", &format!("identification (budget {IDENTIFICATION_TIMEOUT:?}): {e}"))
             })?;
         observer.on_identification(&identification).await;
-        // Publish who the head unit is (/var/lib/rascar/headunit.json). Off the
-        // async thread; observes only, sends nothing.
-        crate::headunit::record_identification(&identification);
 
         device_state("Authenticating", "requesting the accessory certificate");
         let certificate = timeout(AUTHENTICATION_TIMEOUT, self.authenticate(challenge))
@@ -335,198 +331,30 @@ where
             );
         }
 
-        // Heartbeat interval. Measured at the Jaguar: after auth it subscribes to
-        // NowPlaying/Power updates, then if the phone goes silent on the control
-        // link it tears the USB session down ~7.9 s from enumeration (during
-        // streaming this looks like "sent one keyframe then disconnected"). A real
-        // phone keeps pushing updates. `receive_data` blocks up to ~46 s, so poll it
-        // with a short timeout and, on each idle window, push a NowPlayingUpdate to
-        // keep the control link warm. The reader is cancellation-safe.
-        // DEFAULT OFF since 2026-09-20. The comment above describes the theory this
-        // heartbeat was built on; it did not hold — with the heartbeat running the
-        // car still tore the session down, and the 0x5001 in flight when it died was
-        // this heartbeat's. iAP2 has no keepalive message: the link layer's own ACKs
-        // are the liveness mechanism, which is why the reference implementation sends
-        // nothing on an idle control session and emits `NowPlayingUpdate` only in
-        // direct response to `StartNowPlayingUpdates`. Re-pushing an identical media
-        // delta every 1.2 s during a screen session is something no phone does, and
-        // if the car ever sends `StopNowPlayingUpdates` (0x5002 — which it declares
-        // it can send, and which we do not even name) every later beat is an update
-        // on a closed subscription. `RASCAR_IAP2_HEARTBEAT=on` restores it for an A/B.
-        let heartbeat_enabled = crate::debug::env_flag("RASCAR_IAP2_HEARTBEAT", false);
-        info!(
-            "iAP2 NowPlaying heartbeat: {} (RASCAR_IAP2_HEARTBEAT)",
-            if heartbeat_enabled { "ENABLED" } else { "disabled" }
-        );
-        const HEARTBEAT: Duration = Duration::from_millis(1200);
-
-        // Real NowPlaying (see `nowplaying`): a poller task reads rascar-app while
-        // the car's subscription is open; this loop coalesces, diffs and sends.
-        let np_cfg = nowplaying::Config::from_env();
-        let file_session_id = self.link.file_transfer_session_id();
-        let artwork_enabled = np_cfg.artwork && file_session_id.is_some();
-        info!(
-            "iAP2 NowPlaying: metadata {} (RASCAR_NOWPLAYING), artwork {} (RASCAR_NOWPLAYING_ARTWORK; \
-             file transfer session {})",
-            if np_cfg.enabled { "ENABLED" } else { "disabled" },
-            if artwork_enabled { "ENABLED" } else { "disabled" },
-            file_session_id.map(|s| format!("0x{s:02X}")).unwrap_or_else(|| "not declared".into())
-        );
-        let (sub_tx, sub_rx) = tokio::sync::watch::channel(false);
-        let (text_tx, mut text_rx) = tokio::sync::watch::channel(None::<nowplaying::Observed>);
-        let (art_tx, mut art_rx) = tokio::sync::watch::channel(None::<nowplaying::ArtworkReady>);
-        let _poller = np_cfg.enabled.then(|| {
-            let cfg = nowplaying::Config { artwork: artwork_enabled, ..np_cfg.clone() };
-            nowplaying::spawn_poller(cfg, sub_rx, text_tx, art_tx)
-        });
-        let mut np = nowplaying::Publisher::new(np_cfg.app.clone());
-        let mut transfers = nowplaying::FileTransfers::default();
-        // Set by StopNowPlayingUpdates (0x5002): from then on no 0x5001 at all,
-        // the heartbeat included, until the car subscribes again.
-        let mut np_stopped = false;
-
+        // iAP2 has no keepalive message: the link layer's own ACKs are the
+        // liveness mechanism, so an idle control session sends nothing.
         loop {
-            let now = tokio::time::Instant::now();
-
-            // 1. A NowPlaying update whose rate gate is open.
-            if let Some(out) = np.poll(now) {
-                match out {
-                    nowplaying::Outgoing::Update { params, track_changed, summary } => {
-                        if track_changed {
-                            info!("iAP2 NowPlaying: track -> {summary}");
-                        } else {
-                            debug!("iAP2 NowPlaying: playback -> {summary}");
-                        }
-                        if let Err(e) = self.send_control(session_id, 0x5001, &params).await {
-                            warn!("iAP2 NowPlayingUpdate failed: {e}");
-                            device_state("Failed", &format!("NowPlayingUpdate: {e}"));
-                            return Err(e);
-                        }
-                    }
-                    nowplaying::Outgoing::Artwork { file_id, params, data } => {
-                        info!("iAP2 NowPlaying: artwork id 0x{file_id:02X}, {} byte(s)", data.len());
-                        if let Err(e) = self.send_control(session_id, 0x5001, &params).await {
-                            warn!("iAP2 NowPlayingUpdate (artwork id) failed: {e}");
-                            device_state("Failed", &format!("NowPlayingUpdate: {e}"));
-                            return Err(e);
-                        }
-                        transfers.enqueue(file_id, data);
-                    }
-                }
-                continue;
-            }
-
-            // 2. Artwork transfer: abandon an unanswered one, else send the next
-            //    datagram — but never ahead of car traffic already queued.
-            if let Some((id, outcome)) = transfers.on_timeout(now) {
-                warn!("iAP2 file transfer 0x{id:02X}: {outcome:?} — no reply from the car, abandoned");
-            }
-            if let Some(fsid) = file_session_id.filter(|_| !self.link.has_pending()) {
-                let chunk = self.link.max_payload().saturating_sub(2);
-                if let Some(dg) = transfers.next_datagram(chunk, now) {
-                    debug!(
-                        "iAP2 file transfer -> session=0x{fsid:02X} id=0x{:02X} op=0x{:02X} {} byte(s)",
-                        dg[0],
-                        dg[1],
-                        dg.len() - 2
-                    );
-                    if let Err(e) = self.link.send_data(fsid, Bytes::from(dg)).await {
-                        warn!("iAP2 file transfer datagram failed: {e}");
-                        device_state("Failed", &format!("file transfer: {e}"));
-                        return Err(e);
-                    }
-                    continue;
-                }
-            }
-
-            // 3. Wait for the car, a new observation, or the next deadline.
-            let deadline = [np.next_deadline(), transfers.next_deadline()].into_iter().flatten().min();
-            let received = tokio::select! {
-                biased;
-                r = timeout(HEARTBEAT, self.link.receive_data()) => r,
-                Ok(()) = text_rx.changed(), if np_cfg.enabled => {
-                    let obs = text_rx.borrow_and_update().clone();
-                    if let Some(obs) = obs {
-                        np.offer(obs);
-                    }
-                    continue;
-                }
-                Ok(()) = art_rx.changed(), if artwork_enabled => {
-                    let art = art_rx.borrow_and_update().clone();
-                    if let Some(art) = art {
-                        np.offer_artwork(art);
-                    }
-                    continue;
-                }
-                _ = tokio::time::sleep_until(deadline.unwrap_or(now)), if deadline.is_some() => continue,
-            };
-
-            let packet = match received {
-                Ok(Ok(packet)) => packet,
-                Ok(Err(Iap2Error::Timeout)) => {
+            let packet = match self.link.receive_data().await {
+                Ok(packet) => packet,
+                Err(Iap2Error::Timeout) => {
                     debug!("iAP2 link idle — no accessory traffic in the last window, still serving");
                     continue;
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     warn!("iAP2 link service loop stopping: {}", e);
                     device_state("Failed", &format!("service loop: {e}"));
                     return Err(e);
                 }
-                Err(_elapsed) => {
-                    if !heartbeat_enabled {
-                        debug!("iAP2 link idle for {HEARTBEAT:?} — not sending anything (heartbeat disabled)");
-                        continue;
-                    }
-                    if np_stopped {
-                        debug!("iAP2 heartbeat: car sent StopNowPlayingUpdates — not beating");
-                        continue;
-                    }
-                    // Idle for HEARTBEAT with no accessory traffic — push a
-                    // NowPlayingUpdate keepalive so the car does not consider the
-                    // control link dead and drop CarPlay mid-stream. Once real
-                    // metadata went out, the beat repeats the CURRENT playback
-                    // state instead of the "Stopped" reset, which would blank the
-                    // car's now-playing display every beat.
-                    let beat = match np.heartbeat(tokio::time::Instant::now()) {
-                        Some(params) => vec![(0x5001, params, "NowPlayingUpdate(current playback)")],
-                        None => control::subscription_replies(0x5000),
-                    };
-                    for (mid, params, what) in beat {
-                        if let Err(e) = self.send_control(session_id, mid, &params).await {
-                            warn!("iAP2 heartbeat {what} (0x{mid:04X}) failed: {e}");
-                            device_state("Failed", &format!("heartbeat: {e}"));
-                            return Err(e);
-                        }
-                    }
-                    continue;
-                }
             };
 
-            match packet.session_id {
-                Some(sid) if Some(sid) == file_session_id => {
-                    // The car's side of a file transfer (Start/Pause/Success/...).
-                    let p = &packet.payload;
-                    info!(
-                        "iAP2 file transfer <- session=0x{sid:02X}: {}",
-                        crate::debug::hex_prefix(p, 16)
-                    );
-                    if let Some((id, outcome)) = transfers.on_datagram(p) {
-                        info!("iAP2 file transfer 0x{id:02X}: {outcome:?}");
-                    }
-                    continue;
-                }
-                Some(sid) if sid != session_id => {
-                    // EA sessions (e.g. mySPIN over iAP2) land here: keep the head of
-                    // the payload so a capture shows what the accessory speaks.
-                    info!(
-                        "Acknowledged {} byte(s) on non-control session 0x{:02X}: {}",
-                        packet.payload.len(),
-                        sid,
-                        crate::debug::hex_prefix(&packet.payload, 64)
-                    );
-                    continue;
-                }
-                _ => {}
+            if let Some(sid) = packet.session_id.filter(|sid| *sid != session_id) {
+                info!(
+                    "Acknowledged {} byte(s) on non-control session 0x{:02X}: {}",
+                    packet.payload.len(),
+                    sid,
+                    crate::debug::hex_prefix(&packet.payload, 64)
+                );
+                continue;
             }
             assembler.push(&packet.payload);
             loop {
@@ -557,7 +385,6 @@ where
                                         info!("car GPS: {s}");
                                     }
                                     crate::iap2::sink_car_nmea(s);
-                                    crate::gps_clock::on_car_nmea(s);
                                 }
                                 Some(s) => warn!("car GPS: BAD NMEA checksum, dropped: {s}"),
                                 None => {}
@@ -578,10 +405,6 @@ where
                         // no longer answers 0xAE03, so map it onto the 0xAE00 reply
                         // here only while nothing has been flushed — that still covers
                         // a car that leads with 0xAE03.
-                        if msg.msg_id == 0xAE03 {
-                            // The car's USB power budget for us -> headunit.json.
-                            crate::headunit::record_power_source(&msg);
-                        }
                         let reply_to = match msg.msg_id {
                             0xAE03 if !power_flushed => 0xAE00,
                             0xAE03 => {
@@ -600,27 +423,6 @@ where
                             }
                         }
 
-                        // NowPlaying subscription state. The reset reply above has
-                        // just gone out; real updates follow once the rate gate
-                        // reopens and the poller has something to say.
-                        if msg.msg_id == 0x5000 && np_cfg.enabled {
-                            let requested = nowplaying::Requested::from_start_message(&msg);
-                            info!(
-                                "iAP2 NowPlaying: car subscribed (media {:?}, playback {:?})",
-                                requested.media, requested.playback
-                            );
-                            np.on_subscribe(requested, tokio::time::Instant::now());
-                            np_stopped = false;
-                            sub_tx.send_replace(true);
-                        } else if msg.msg_id == 0x5000 {
-                            np_stopped = false;
-                        }
-                        if msg.msg_id == 0x5002 {
-                            info!("iAP2 NowPlaying: car sent StopNowPlayingUpdates — no further 0x5001");
-                            np.on_stop();
-                            np_stopped = true;
-                            sub_tx.send_replace(false);
-                        }
                     }
                     Ok(None) => break,
                     Err(e) => {

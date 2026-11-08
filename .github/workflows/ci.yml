@@ -14,22 +14,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: System libraries
-        run: sudo apt-get update && sudo apt-get install -y pkg-config cmake libudev-dev libssl-dev libsdl2-dev libwayland-dev libxkbcommon-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace
 
-  frontend-and-scripts:
+  pi-zero-build:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: JavaScript syntax
-        run: |
-          find app/frontend/js app/chromium-ext -name '*.js' -print0 | xargs -0 -n1 node --check
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: arm-unknown-linux-gnueabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: pip install ziglang && cargo install cargo-zigbuild
+      - run: cargo zigbuild --release --target arm-unknown-linux-gnueabihf.2.31 -p rascar-carplay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rascar-carplay-armv6
+          path: target/arm-unknown-linux-gnueabihf/release/rascar-carplay
+
+  scripts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
       - name: Shell syntax
         run: |
-          grep -rlE '^#!.*(ba)?sh' setup tools kernel experimental/androidauto-setup | xargs -n1 bash -n
+          grep -rlE '^#!.*(ba)?sh' pizero tools kernel | xargs -n1 bash -n
       - name: Python syntax
         run: |
           find . -name '*.py' -not -path './target/*' -print0 | xargs -0 python3 -m py_compile
+      - name: Device-tree overlays
+        run: |
+          sudo apt-get update && sudo apt-get install -y device-tree-compiler
+          for f in pizero/overlays/*.dts; do dtc -@ -q -I dts -O dtb -o /dev/null "$f"; done

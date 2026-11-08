@@ -211,12 +211,6 @@ pub fn derive_chacha_key(ikm: &[u8], stream_connection_id: i64) -> anyhow::Resul
     derive_data_stream_key(ikm, stream_connection_id, b"DataStream-Output-Encryption-Key")
 }
 
-/// The key for what the CAR sends us on a data stream (its microphone on a
-/// telephony audio stream): catplay `compute_keys` pairs "Input" with the
-/// phone's read side and the receiver writes with it.
-pub fn derive_chacha_input_key(ikm: &[u8], stream_connection_id: i64) -> anyhow::Result<[u8; 32]> {
-    derive_data_stream_key(ikm, stream_connection_id, b"DataStream-Input-Encryption-Key")
-}
 
 fn derive_data_stream_key(ikm: &[u8], stream_connection_id: i64, info: &[u8]) -> anyhow::Result<[u8; 32]> {
     let id = stream_connection_id as u64;
