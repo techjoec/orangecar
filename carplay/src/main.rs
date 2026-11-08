@@ -116,6 +116,10 @@ async fn main() -> Result<()> {
     // `_carplay-ctrl` in time.
     let _ctrl_adv = host::ctrl_advertise::spawn();
 
+    // Encode the static screen clip now (once per display size; cached on disk),
+    // long before the car asks for it, so the session itself never runs ffmpeg.
+    stream::video::prewarm();
+
     info!("=== RasCar CarPlay Transmitter — Phase 1 (Apple enumeration + role-switch capture) ===");
 
     // Phase 1a: USB gadget + FunctionFS setup, presenting an Apple iPhone identity.

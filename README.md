@@ -13,8 +13,9 @@ then streams a picture to the car's screen:
 - touches and steering-wheel keys from the car come back as text lines on UDP.
 
 The dashboard, maps, music, OBD-II, 4G, phone calls, Now Playing, OTA updates and the Android Auto
-experiments are gone. Audio was removed too: this build never claims the car's audio, so the radio
-keeps playing.
+experiments are gone. Audio is gone too: no capture, no audio stream, and the car's audio is never
+claimed, so the radio keeps playing. Video for a still picture is encoded once and replayed (see
+[static mode](#whats-on-the-screen)), so a session costs the Pi almost no CPU.
 
 You don't need an iPhone, an MFi chip or a jailbreak. The car authenticates *itself* to the phone,
 so the phone side has nothing to prove.
@@ -103,7 +104,16 @@ Set `RASCAR_VIDEO_SOURCE` in `/etc/rascar/carplay.env`:
 | `ffmpeg:<args>` | raw ffmpeg input arguments, e.g. `ffmpeg:-f v4l2 -i /dev/video0` for a camera |
 
 Every source is scaled to the display size the car reports, and encoded with the Pi's hardware H.264
-encoder (`h264_v4l2m2m`). Other knobs: `RASCAR_VIDEO_FPS` (15), `RASCAR_VIDEO_BITRATE_KBPS` (2000),
+encoder (`h264_v4l2m2m`).
+
+**Static mode (default for `test`, `color:` and `image:`).** The picture is encoded **once**, as a
+one-second clip (one keyframe plus near-empty P-frames, a few KB), cached in
+`/var/lib/rascar/video-cache/` and then replayed from memory in a loop. During a session no encoder
+runs at all: the Pi only encrypts and sends a few KB per second. The clip for the last display size
+the car reported is pre-encoded at service start, so the first frame goes out immediately. A new car
+(new size), image, or setting costs one encode (a second or two) at the first session. `fb` and
+`ffmpeg:` are live sources and always run ffmpeg; `RASCAR_VIDEO_MODE=live` forces live encoding for
+the others too. Other knobs: `RASCAR_VIDEO_FPS` (15), `RASCAR_VIDEO_BITRATE_KBPS` (2000),
 `RASCAR_VIDEO_KEYINT` (15), `RASCAR_VIDEO_ENCODER` (`v4l2m2m` / `x264` / `openh264`).
 
 ## Touch and buttons
@@ -128,9 +138,10 @@ Pressing the CarPlay icon on the car (or `screen phone`) takes it back.
 ## Limits on a Pi Zero W
 
 - **Timing.** The tested car tears the session down if the first keyframe is late (about 7.8 s from
-  USB enumeration). ffmpeg starts at screen SETUP, and on a Zero it starts slowly. If the session dies
-  right after `screen SETUP`, lower the resolution cost: `RASCAR_VIDEO_SOURCE=color:…` and
-  `RASCAR_VIDEO_FPS=10`.
+  USB enumeration). In static mode the cached clip is sent instantly. The exceptions are the first
+  session with a new display size and live sources (`fb`, `ffmpeg:`), which start ffmpeg at screen
+  SETUP; that is slow on a Zero. If such a session dies right after `screen SETUP`, just retry: the
+  clip is cached by then.
 - **Boot time.** A Zero takes ~30 s to boot. If the car powers it, the car may give up before the Pi
   is ready. Unplug and replug, or power the Pi separately.
 - **USB endpoints.** The Pi's dwc2 has 7 device endpoints. The largest iPhone configuration needs 7.

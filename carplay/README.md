@@ -23,7 +23,7 @@ findings behind it are in [`docs/protocol.md`](../docs/protocol.md).
 | `src/iap2/` | **Phase 2, iAP2 device stack.** `packet.rs`/`link.rs` = link layer; `control.rs` = control session (identification, accept-all authentication, post-auth notifications, location). |
 | `src/host/` | **Phase 3, USB host side.** `role_switch.rs` flips the dwc2 OTG port to host (`/sys/class/usb_role`, or `RASCAR_ROLE_SWITCH_CMD`); `usb_host.rs` finds the car and opens the iAP2 bulk pipe; `ncm.rs` brings up the CDC-NCM interface and discovers the receiver; `ctrl_advertise.rs` + `mdns_ctrl.rs` answer the car's `_carplay-ctrl._tcp` browse. |
 | `src/airplay/` | **Phase 4, CarPlay control.** `rtsp.rs` (RTSP + binary plist), `pairing.rs` (pair-setup SRP-6a / pair-verify, persisted identity), `carplay_session.rs` (SETUP, `/info`, RECORD, `modesChanged`, keepalive, screen stream, HID), `hid.rs` (HID descriptors and key decoding). |
-| `src/stream/` | **Phase 5, screen.** `video.rs` produces the picture and H.264-encodes it with ffmpeg; `crypto.rs` encrypts frames; `events.rs` forwards car touches/keys over UDP; `screen.rs` hands the screen back to the car's native UI and takes it again. |
+| `src/stream/` | **Phase 5, screen.** `video.rs` produces the picture and H.264-encodes it with ffmpeg (once, then replays a cached clip, for still sources); `crypto.rs` encrypts frames; `events.rs` forwards car touches/keys over UDP; `screen.rs` hands the screen back to the car's native UI and takes it again. |
 | `src/debug.rs` | Phase timers, wire tracing, the `env_flag` helper used by most knobs. |
 
 ## Run phases
@@ -127,6 +127,8 @@ default.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `RASCAR_VIDEO_SOURCE` | `test` | Picture: `test`, `color:RRGGBB`, `image:PATH`, `fb[:/dev/fbN]`, `ffmpeg:ARGS`. |
+| `RASCAR_VIDEO_MODE` | `static` (`live` for `fb`/`ffmpeg:`) | `static`: encode a one-GOP clip once, cache it, replay it (no encoder during a session). `live`: run ffmpeg for the whole session. |
+| `RASCAR_VIDEO_CACHE` | `/var/lib/rascar/video-cache` | Where static clips (and the last display size, for the pre-encode at start) are kept. |
 | `RASCAR_VIDEO_ENCODER` | probed | `v4l2m2m` (Pi hardware), `x264` or `openh264`. |
 | `RASCAR_VIDEO_FPS` | `15` | Screen stream frame rate. |
 | `RASCAR_VIDEO_BITRATE_KBPS` | `2000` | H.264 bitrate. |
