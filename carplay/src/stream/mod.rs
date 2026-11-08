@@ -10,6 +10,8 @@
 //!   * [`input`]: touch injection (uinput / XTest) and coordinate mapping.
 //!   * [`crypto`], [`screen`], [`carkeys`]: stream ciphers, screen ownership,
 //!     steering-wheel keys.
+//!   * [`events`]: car touches/keys as UDP text lines, for a picture source
+//!     other than the dashboard (`RASCAR_EVENTS_ADDR`).
 //!
 //! [`run`] drives the Apple TV style mirroring session (`airplay::run`): it
 //! renders, packetizes video in the AirPlay mirroring format, keeps `/feedback`
@@ -30,6 +32,7 @@ pub mod audio;
 pub mod call;
 pub mod carkeys;
 pub mod crypto;
+pub mod events;
 pub mod input;
 pub mod render;
 pub mod screen;

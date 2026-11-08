@@ -871,6 +871,7 @@ fn handle_key_edges(device: &str, uuid: &str, report: &[u8], edges: &[hid::KeyEd
             hid::KeyEdge::Down(u) => match hid::CarKey::from_usage(*u) {
                 Some(k) => {
                     let sent = crate::stream::carkeys::send(k);
+                    crate::stream::events::send(&format!("key {}", k.wire_name()));
                     info!(
                         "car key: {device} uuid={uuid} report={} → press {} → dashboard '{}'{} (car borrows audio={})",
                         hex::encode(report),
@@ -1095,6 +1096,31 @@ fn spawn_touch_injector(
     })
 }
 
+/// No dashboard to inject into: map car touches onto the encoded picture and
+/// send them as `touch down|move|up X Y` lines (`stream::events`) for whatever
+/// draws the picture (e.g. an app on the Pi's framebuffer).
+fn spawn_touch_forwarder(
+    mut touch_rx: mpsc::UnboundedReceiver<HidTouch>,
+    car_res: (u32, u32),
+    pic_res: (u32, u32),
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut was_down = false;
+        while let Some(t) = touch_rx.recv().await {
+            let action = match (was_down, t.down) {
+                (false, true) => "down",
+                (true, true) => "move",
+                (true, false) => "up",
+                (false, false) => continue, // spurious up-while-up
+            };
+            was_down = t.down;
+            let (x, y) = map_coords(t.x as u32, t.y as u32, car_res, pic_res);
+            debug!("touch {action} car=({},{}) → ({x},{y})", t.x, t.y);
+            crate::stream::events::send(&format!("touch {action} {x} {y}"));
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // keepAlivePort UDP keepalive
 // ---------------------------------------------------------------------------
@@ -1290,6 +1316,26 @@ async fn wait_screen_back(
                     bail!("/feedback stopped while the car owned the screen");
                 }
             }
+        }
+    }
+}
+
+/// `RASCAR_VIDEO_MODE=none`: keep MainScreen with the car for the whole session.
+/// A requestUI (the driver pressing the car's CarPlay icon) is answered by
+/// restating that the screen is the car's: there is no picture to show.
+/// Returns when the session ends (event channel or /feedback gone).
+async fn hold_screen_with_car(
+    rtsp: &SharedRtsp,
+    rx: &mut tokio::sync::watch::Receiver<crate::stream::screen::ScreenOwner>,
+    event_task: &tokio::task::JoinHandle<()>,
+    feedback: &tokio::task::JoinHandle<()>,
+) -> Result<()> {
+    loop {
+        wait_screen_back(rx, event_task, feedback).await?;
+        info!("screen: requestUI, but there is no video (RASCAR_VIDEO_MODE=none) — the screen stays the car's");
+        crate::stream::screen::request(crate::stream::screen::ScreenOwner::Car);
+        if let Err(e) = send_screen_modes_changed(rtsp, true).await {
+            warn!("screen: modesChanged(screen=car) failed: {e:#}");
         }
     }
 }
@@ -2923,7 +2969,14 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
     //
     // SCREEN_TO_CAR is deliberately NOT set: no stream exists yet, and a
     // concurrent ChangeModesResponse must keep stating the screen as ours.
-    if initial_screen_sync(info_screen_take) {
+    // RASCAR_VIDEO_MODE=none: no video at all. MainScreen is announced as the
+    // car's from the start and no screen stream is ever set up: the car keeps
+    // its own UI while the CarPlay session (iAP2, control channel, /feedback)
+    // stays up. Used by the minimal "iPhone side only" profile (`pizero/`).
+    let video_noop = crate::stream::video::noop();
+    if video_noop {
+        info!("video: RASCAR_VIDEO_MODE=none — no screen stream; MainScreen stays the car's");
+    } else if initial_screen_sync(info_screen_take) {
         info!("→ POST /command modesChanged (initial sync: MainScreen is the car's, as /info says)");
         let sync_body = modes_changed_body(false, true).context("marshal initial-sync modesChanged plist")?;
         let resp = rtsp
@@ -2939,7 +2992,15 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
     } else {
         info!("initial screen sync skipped (/info MainScreen takeConstraint={info_screen_take:?})");
     }
-    let modes_body = build_modes_changed_body(false).context("marshal modesChanged plist")?;
+    if video_noop {
+        SCREEN_TO_CAR.store(true, Ordering::Relaxed);
+        crate::stream::screen::request(crate::stream::screen::ScreenOwner::Car);
+    }
+    let modes_body = if video_noop {
+        modes_changed_body(false, true).context("marshal modesChanged plist")?
+    } else {
+        build_modes_changed_body(false).context("marshal modesChanged plist")?
+    };
     let resp = rtsp
         .request("POST", "/command", PLIST_CT, &modes_body, &Vec::new())
         .await
@@ -2950,22 +3011,38 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
     info!("← modesChanged OK");
 
     // --- 6+7. SETUP / (per-stream, type 110) and open the screen data channel ---
-    let screen = open_screen_stream(&mut rtsp, peer, &display_uuid).await?;
+    let screen = if video_noop {
+        None
+    } else {
+        Some(open_screen_stream(&mut rtsp, peer, &display_uuid).await?)
+    };
 
     // --- 8. Render the dashboard and start the encoder ---
     // The capture surface is sized to the car's negotiated dims (or, if a real
     // kiosk `:0` already exists, to its actual geometry). Capture/encode at the
     // EFFECTIVE geometry so x11grab never asks for a region larger than the root.
-    let (_render_guard, cap_w, cap_h) =
-        render::ensure_dashboard(width, height).await.context("render dashboard")?;
+    // Another picture source (RASCAR_VIDEO_SOURCE) needs no dashboard at all.
+    let dashboard = crate::stream::video::uses_dashboard() && !video_noop;
+    let (_render_guard, cap_w, cap_h) = if dashboard {
+        let (guard, w, h) = render::ensure_dashboard(width, height).await.context("render dashboard")?;
+        (Some(guard), w, h)
+    } else {
+        // The H.264 encoders want even dimensions.
+        (None, width & !1, height & !1)
+    };
 
     // Touch injector: map the car's HID logical space to the dashboard surface.
     // `(width, height)` is the display size, NOT the touch range — see HID_TOUCH_LOGICAL.
     // Wayland: no X display to drive with XTest — an empty display selects the
     // uinput touchscreen, which the compositor reads through libinput.
-    let wayland = render::wayland_target();
-    let touch_display = if wayland.is_some() { String::new() } else { render::x_display() };
-    let _touch_task = spawn_touch_injector(touch_rx, HID_TOUCH_LOGICAL, (cap_w, cap_h), touch_display);
+    // Without the dashboard, touches go out as UDP text lines (`stream::events`).
+    let wayland = if dashboard { render::wayland_target() } else { None };
+    let _touch_task = if dashboard {
+        let touch_display = if wayland.is_some() { String::new() } else { render::x_display() };
+        spawn_touch_injector(touch_rx, HID_TOUCH_LOGICAL, (cap_w, cap_h), touch_display)
+    } else {
+        spawn_touch_forwarder(touch_rx, HID_TOUCH_LOGICAL, (cap_w, cap_h))
+    };
 
     let mut encoder = VideoEncoder::new(VideoSettings {
         display: render::x_display(),
@@ -2979,7 +3056,9 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
         // VideoConfig with it.
         ..Default::default()
     });
-    encoder.start().await.context("start ffmpeg encoder")?;
+    if !video_noop {
+        encoder.start().await.context("start ffmpeg encoder")?;
+    }
 
     // Screen encryption, keyed with the SAME streamConnectionID advertised in the
     // screen SETUP above:
@@ -2990,7 +3069,7 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
     //     (catplay `derive_aes_stream_keys(&[0;16], id)`); the car's keystream
     //     comes from that id.
     // VideoConfig / KeepAlive frames stay plaintext and do NOT advance the cipher.
-    let mut cipher = screen_cipher(paired_secret.as_deref(), screen.stream_connection_id);
+    let mut cipher = screen_cipher(paired_secret.as_deref(), screen.as_ref().map_or(0, |s| s.stream_connection_id));
 
     // Share the control client so `/feedback`, keepalive, the audio SETUP and
     // TEARDOWN can all use it (it is no longer moved into the feedback task).
@@ -3087,8 +3166,10 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
     //
     // Audio, the event channel, /feedback and the keepalive run throughout.
     // The VideoConfig header advertises the ENCODED frame dims (= capture dims).
-    let mut screen = Some(screen);
-    let stream_result = loop {
+    let mut screen = screen;
+    let stream_result = if video_noop {
+        hold_screen_with_car(&rtsp, &mut screen_owner, &event_task, &feedback).await
+    } else { loop {
         let Some(ScreenStream { wr, drain, .. }) = screen.take() else {
             break Err(anyhow!("screen loop without a screen stream"));
         };
@@ -3155,7 +3236,7 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
         }
         info!("screen: new screen stream ready ({} ms) — VideoConfig + keyframe follow", t1.elapsed().as_millis());
         screen = Some(s);
-    };
+    } };
 
     // --- 10b. POSTMORTEM ---
     //
@@ -3193,7 +3274,9 @@ pub async fn run_carplay(endpoint: &AirPlayEndpoint) -> Result<()> {
     }
     encoder.stop().await;
     // Send TEARDOWN on the control channel (media data socket already dropped).
-    send_teardown(&rtsp, &display_uuid).await;
+    if !video_noop {
+        send_teardown(&rtsp, &display_uuid).await;
+    }
     // _render_guard drops here (kills Xvfb/Chromium if we started them).
     stream_result
 }

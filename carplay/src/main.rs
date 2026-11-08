@@ -168,7 +168,12 @@ async fn main() -> Result<()> {
     // hangs keeps the car from ever seeing us (2026-09-30 drive 3: a wedged
     // compositor + unbounded wlr-randr, no connection all drive). Past the cap
     // the half-started kiosk is dropped (killed) and screen SETUP cold-starts.
-    let _render_prewarm = match tokio::time::timeout(
+    // Only when the picture IS the dashboard (RASCAR_VIDEO_SOURCE unset). Any
+    // other source pre-encodes its static clip instead (stream::video::prewarm).
+    stream::video::prewarm();
+    let _render_prewarm = if !stream::video::uses_dashboard() || stream::video::noop() {
+        None
+    } else { match tokio::time::timeout(
         std::time::Duration::from_secs(20),
         stream::render::ensure_dashboard(1200, 512),
     )
@@ -183,7 +188,7 @@ async fn main() -> Result<()> {
             warn!("render pre-warm did not finish within 20 s — dropped, carrying on with the USB start (will cold-start at screen SETUP)");
             None
         }
-    };
+    } };
 
     // Advertise `_carplay-ctrl._tcp` NOW, before the USB handshake, so avahi has
     // probed + committed the record long before the car browses it (~t+3 s) and can
