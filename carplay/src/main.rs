@@ -116,6 +116,15 @@ struct Cli {
     /// what it found and how loud the captured audio was, then exit.
     #[arg(long)]
     audio_probe: bool,
+
+    /// The car is already enumerated as a USB device on this host: skip the
+    /// Apple gadget and the role switch (Phases 1 and 2's USB side) and run
+    /// Phases 3 to 5 against it. For a head unit whose device side reaches
+    /// this host another way, such as a USB/IP import of an emulated unit.
+    /// Set `RASCAR_UDC` to the controller the device sits under (`vhci_hcd.0`
+    /// for USB/IP), since the car scan only accepts devices below it.
+    #[arg(long)]
+    host_only: bool,
 }
 
 #[tokio::main]
@@ -200,6 +209,18 @@ async fn main() -> Result<()> {
     // Android persona probe (RASCAR_PERSONA=android): no Apple gadget at all.
     if usb::aoa_probe::enabled() {
         return usb::aoa_probe::run().await;
+    }
+
+    // Car already on the bus (--host-only): no gadget, no role switch.
+    if cli.host_only {
+        info!("=== RasCar CarPlay Transmitter — host-only (car device already attached) ===");
+        let result = run_phase3_and_iap2(true).await;
+        if let Err(e) = &result {
+            error!("carplay host-only run ended with error: {e:#}");
+        }
+        host::clear_ncm_hold_at_exit();
+        info!("carplay transmitter shutdown complete (t+{} ms)", debug::elapsed_ms());
+        return result;
     }
 
     info!("=== RasCar CarPlay Transmitter — Phase 1 (Apple enumeration + role-switch capture) ===");
@@ -327,7 +348,7 @@ async fn run_gadget_session() -> Result<()> {
 
     match capture {
         // All ep0 fds are closed; Phase 3 fully removes the gadget before the switch.
-        Ok(ffs::CaptureOutcome::RoleSwitchRequested) => run_phase3_and_iap2().await,
+        Ok(ffs::CaptureOutcome::RoleSwitchRequested) => run_phase3_and_iap2(false).await,
         Err(e) => {
             error!("ep0 capture ended: {e:#}");
             Err(e)
@@ -439,13 +460,19 @@ const AIRPLAY_PORT: u16 = 7000;
 
 /// Phase 3 (USB host transition + iAP2 transport + CDC-NCM + Bonjour) followed by
 /// Phase 2 (iAP2 Device bring-up) over the resulting host transport.
-async fn run_phase3_and_iap2() -> Result<()> {
+async fn run_phase3_and_iap2(existing_device: bool) -> Result<()> {
     // Phase 3 hands us a `UsbHostTransport` (the car's iAP2 bulk interface) plus
     // the NCM link + discovered AirPlay endpoint(s). It first removes the whole
     // gadget (callback: UDC unbind + configs + FunctionFS umount), then unbinds
-    // fusb302 and writes dwc3 mode=host — the hardware-proven order.
+    // fusb302 and writes dwc3 mode=host — the hardware-proven order. With
+    // `existing_device` (--host-only) the car is already on the bus and both
+    // of those steps are skipped.
     let phase = PhaseTimer::start("3");
-    let phase3 = host::run(gadget::remove).await.context("Phase 3");
+    let phase3 = if existing_device {
+        host::run_existing().await.context("Phase 3 (existing device)")
+    } else {
+        host::run(gadget::remove).await.context("Phase 3")
+    };
     phase.end(&phase3);
     let outcome = phase3?;
 

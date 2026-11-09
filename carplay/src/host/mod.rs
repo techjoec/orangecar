@@ -192,6 +192,32 @@ where
         role_switch::log_role_snapshot("car never enumerated after the role switch");
     }
     let car = waited.context("waiting for car USB device")?;
+    drop(autobind_guard); // restores automatic binding (no-op if we never suppressed)
+    let outcome = attach_car(car, pre_ifaces).await?;
+
+    // Phase 3 succeeded: the port must STAY in host mode.
+    rollback.disarm();
+    Ok(outcome)
+}
+
+/// Phase 3 for a car that is already enumerated as a USB device on this host:
+/// no gadget to tear down and no role switch to perform. Everything from the
+/// device scan on is [`run`]'s own code. The use is a head unit whose device
+/// side reaches this host some other way, such as a USB/IP import of an
+/// emulated unit; `RASCAR_UDC` then names the controller it sits under
+/// (`vhci_hcd.0`), because the scan only accepts devices below that controller.
+pub async fn run_existing() -> Result<Phase3Outcome> {
+    info!("=== Phase 3 (existing device): iAP2 transport + CDC-NCM + Bonjour, no gadget, no role switch ===");
+    let pre_ifaces: HashSet<String> = ncm::snapshot_interfaces();
+    let car = usb_host::wait_for_car_device(CAR_ENUM_TIMEOUT, CAR_ENUM_POLL)
+        .await
+        .context("waiting for the already-attached car USB device")?;
+    attach_car(car, pre_ifaces).await
+}
+
+/// Steps 2b onwards of Phase 3: claim the iAP2 interface of an enumerated car
+/// and settle NCM. Shared by [`run`] and [`run_existing`].
+async fn attach_car(car: usb_host::CarDevice, pre_ifaces: HashSet<String>) -> Result<Phase3Outcome> {
     let summary = CarDeviceSummary {
         vendor_id: car.info.vendor_id(),
         product_id: car.info.product_id(),
@@ -201,10 +227,8 @@ where
     let car_sysfs: PathBuf = car.info.sysfs_path().to_path_buf();
 
     // The car's interfaces are registered now and no kernel driver has claimed
-    // them. Re-enable autoprobe immediately: it only affects devices that appear
-    // from here on, and leaving it off would stop the kernel binding anything on
-    // every other USB port.
-    drop(autobind_guard); // restores automatic binding (no-op if we never suppressed)
+    // them (the caller re-enabled autoprobe, which only affects devices that
+    // appear from here on).
     pin_device_awake(&car_sysfs);
 
     // CONTROL EXPERIMENT (RASCAR_ENUM_THEN_IDLE_MS): enumerate the car and then do
@@ -263,9 +287,6 @@ where
         "phase3: iAP2 transport claimed at t+{} ms — NCM bind settled, starting iAP2 bring-up",
         crate::debug::elapsed_ms()
     );
-
-    // Phase 3 succeeded: the port must STAY in host mode.
-    rollback.disarm();
 
     Ok(Phase3Outcome {
         transport,
