@@ -250,12 +250,24 @@ where
             self.config.timeout_ms,
             syn_budget_ms as f64 / 1000.0
         );
+        // Opt-in (RASCAR_IAP2_SEND_DETECT=1): send the detect sequence ourselves,
+        // once up front and again on every timed-out wait. The reference car
+        // sends it first; an accessory stack that waits for the Apple device
+        // to open with it would otherwise sit silent on the other end.
+        let send_detect = crate::debug::env_flag("RASCAR_IAP2_SEND_DETECT", false);
+        if send_detect {
+            info!("RASCAR_IAP2_SEND_DETECT on: sending the iAP2 detect sequence to the accessory");
+            self.write_all_resilient(&IAP2_DETECT).await?;
+        }
         let mut syn_attempt: u32 = 0;
         let syn = loop {
             let packet = match self.read_packet_with_timeout().await {
                 Ok(packet) => packet,
                 Err(Iap2Error::Timeout) => {
                     syn_attempt += 1;
+                    if send_detect {
+                        self.write_all_resilient(&IAP2_DETECT).await?;
+                    }
                     if syn_attempt > self.config.max_retries {
                         warn!(
                             "No SYN from the accessory after {:.1} s — giving up on link negotiation",

@@ -35,7 +35,7 @@ use tracing::{debug, info, warn};
 
 use nusb::descriptors::TransferType;
 use nusb::io::{EndpointRead, EndpointWrite};
-use nusb::transfer::{Bulk, In, Out};
+use nusb::transfer::{Bulk, In, Interrupt, Out};
 use nusb::{Device, DeviceInfo, Interface};
 
 /// USB Communications Device Class (CDC) — the NCM interface's class.
@@ -65,6 +65,12 @@ pub struct CarDevice {
     pub iap2_ep_in: u8,
     /// Bulk OUT endpoint address of the iAP2 interface (us → car).
     pub iap2_ep_out: u8,
+    /// Interrupt IN endpoint of the iAP2 interface, when the accessory has
+    /// one. Some accessory stacks (QNX io-otg-cinemo) queue a packet on it
+    /// at start-up and go no further until the host has polled it, so
+    /// [`UsbHostTransport::open`] keeps a read posted there. The reference
+    /// car's interface has no such endpoint.
+    pub iap2_ep_int: Option<u8>,
     /// bInterfaceNumber of the CDC-NCM interface, if present.
     pub ncm_interface: Option<u8>,
 }
@@ -317,7 +323,7 @@ async fn inspect_device(info: &DeviceInfo) -> Result<Option<CarDevice>> {
         );
     }
 
-    let mut iap2: Option<(u8, u8, u8, u8)> = None; // (iface, alt, ep_in, ep_out)
+    let mut iap2: Option<(u8, u8, u8, u8, Option<u8>)> = None; // (iface, alt, ep_in, ep_out, ep_int)
     let mut ncm_interface: Option<u8> = None;
 
     for iface in config.interface_alt_settings() {
@@ -341,7 +347,12 @@ async fn inspect_device(info: &DeviceInfo) -> Result<Option<CarDevice>> {
         if cls == CLASS_VENDOR && iap2.is_none() {
             let mut ep_in: Option<u8> = None;
             let mut ep_out: Option<u8> = None;
+            let mut ep_int: Option<u8> = None;
             for ep in iface.endpoints() {
+                if ep.transfer_type() == TransferType::Interrupt && ep.address() & 0x80 != 0 {
+                    ep_int.get_or_insert(ep.address());
+                    continue;
+                }
                 if ep.transfer_type() != TransferType::Bulk {
                     continue;
                 }
@@ -356,9 +367,9 @@ async fn inspect_device(info: &DeviceInfo) -> Result<Option<CarDevice>> {
                 (Some(i), Some(o)) => {
                     info!(
                         "usb-host: found vendor iAP2 interface #{num} alt {alt} (class 0x{cls:02x}) \
-                         bulk IN=0x{i:02x} OUT=0x{o:02x}"
+                         bulk IN=0x{i:02x} OUT=0x{o:02x} interrupt IN={ep_int:?}"
                     );
-                    iap2 = Some((num, alt, i, o));
+                    iap2 = Some((num, alt, i, o, ep_int));
                 }
                 _ => debug!(
                     "usb-host: vendor interface #{num} alt {alt} lacks a bulk IN+OUT pair (in={ep_in:?} out={ep_out:?})"
@@ -367,7 +378,7 @@ async fn inspect_device(info: &DeviceInfo) -> Result<Option<CarDevice>> {
         }
     }
 
-    let Some((iap2_interface, iap2_alt, iap2_ep_in, iap2_ep_out)) = iap2 else {
+    let Some((iap2_interface, iap2_alt, iap2_ep_in, iap2_ep_out, iap2_ep_int)) = iap2 else {
         return Ok(None);
     };
 
@@ -382,6 +393,7 @@ async fn inspect_device(info: &DeviceInfo) -> Result<Option<CarDevice>> {
         iap2_alt,
         iap2_ep_in,
         iap2_ep_out,
+        iap2_ep_int,
         ncm_interface,
     }))
 }
@@ -407,6 +419,17 @@ pub struct UsbHostTransport {
     /// Endpoint addresses, for wire-trace labels and `clear_halt` logging.
     ep_in: u8,
     ep_out: u8,
+    /// The interrupt IN poller, when the interface has that endpoint; aborted
+    /// with the transport.
+    interrupt_poller: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for UsbHostTransport {
+    fn drop(&mut self) {
+        if let Some(task) = self.interrupt_poller.take() {
+            task.abort();
+        }
+    }
 }
 
 impl UsbHostTransport {
@@ -454,6 +477,35 @@ impl UsbHostTransport {
         let reader = ep_in.reader(TRANSFER_BUFFER);
         let writer = ep_out.writer(TRANSFER_BUFFER);
 
+        // Keep the accessory's interrupt IN endpoint polled. What arrives is
+        // logged and dropped: the iAP2 link itself runs on the bulk pair.
+        let interrupt_poller = match car.iap2_ep_int {
+            Some(addr) => {
+                let ep = interface
+                    .endpoint::<Interrupt, In>(addr)
+                    .with_context(|| format!("opening iAP2 interrupt IN 0x{addr:02x}"))?;
+                let mut int_reader = ep.reader(64);
+                info!("usb-host: polling iAP2 interrupt IN 0x{addr:02x}");
+                Some(tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match int_reader.read(&mut buf).await {
+                            Ok(n) => info!(
+                                "usb-host: iAP2 interrupt IN 0x{addr:02x}: {n} byte(s) {}",
+                                hex::encode(&buf[..n])
+                            ),
+                            Err(e) => {
+                                warn!("usb-host: iAP2 interrupt IN 0x{addr:02x} read failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }))
+            }
+            None => None,
+        };
+
         info!(
             "usb-host: iAP2 bulk transport ready (buffered, {TRANSFER_BUFFER} B/transfer, wire_trace={})",
             crate::debug::wire_trace()
@@ -464,6 +516,7 @@ impl UsbHostTransport {
             writer: Some(writer),
             ep_in: car.iap2_ep_in,
             ep_out: car.iap2_ep_out,
+            interrupt_poller,
         })
     }
 }
